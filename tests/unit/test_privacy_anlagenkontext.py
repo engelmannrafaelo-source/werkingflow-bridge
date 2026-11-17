@@ -788,7 +788,8 @@ def test_R3b_unterstrich_ist_keine_wortgrenze(t):
 def test_R3b_schreibweise_versal_klein(wort):
     # Root R3b-Check: Tabellenueberschriften in Versalien; Vergleich normalisiert gegen DIESELBE positive Liste
     assert ak.ist_bauteil(wort), wort
-    t = f"{wort} P-01 ist eingebaut."
+    # R3c: Zeilen ohne Grossschreibung sind nach der Kennung fail-closed (P-PRV-8); Probe deshalb mit Praeposition
+    t = f"{wort} P-01 im Heizraum."
     frei, _ = _ent(t, [(t.index("P-01"), t.index("P-01") + 4, "ORGANIZATION", "detektor")])
     assert list(frei.values()) == [wort]
 
@@ -808,3 +809,44 @@ def test_R3b_rolle_danach_in_versalien(t):
     k = t.index("B-02")
     frei, _ = _ent(t, [(k, k + 4, "LOCATION", "detektor")])
     assert frei == {}, t
+
+
+
+# ── R3c (Review FINAL e8511fe6: P-PRV-8 - Rolle nach beliebigem Trenner, jede einheitliche Schreibung) ─────────
+
+@pytest.mark.parametrize("t", [
+    "Brunnen B-02 - Herr Sonnwendt", "Brunnen B-02 / Familie Sonnwendt", "Brunnen B-02 - Mieterin",
+    "Brunnen B-02 Mieterin", "Brunnen B-02 — Mieterin", "Brunnen B-02 [Mieterin]", "brunnen B-02, bewohnerin",
+    "Brunnen B-02 – Bewohnerin des Hauses", "Brunnen B-02 :: Patient", "Brunnen B-02 ~ Kollegin",
+    "Brunnen B-02 » Nachbarin", "Brunnen B-02 {Mieterin}", "Brunnen B-02 \"Mieterin\"", "Brunnen B-02 ist die Mieterin",
+    "BRUNNEN B-02 - MIETERIN", "BRUNNEN B-02 BEWOHNERIN", "brunnen B-02 mieterin", "brunnen B-02 - herr sonnwendt",
+    "brunnen B-02 ist bewohnerin", "Brunnen B-02 - Dr. Sonnwendt",
+])
+def test_R3c_P_PRV_8_rolle_nach_beliebigem_trenner(t):
+    k = t.index("B-02")
+    frei, ab = _ent(t, [(k, k + 4, "LOCATION", "detektor")])
+    assert frei == {}, (t, ab)
+
+
+@pytest.mark.parametrize("t", [
+    "Der Schluckbrunnen B-02 ist dicht.", "Die Pumpe P-03 hat Ole Fennimann eingebaut.",
+    "Der Schluckbrunnen B-02 - Heizkreis Nord.", "Der Schluckbrunnen B-02 [Schluckbrunnen] ist dicht.",
+    "Der Schluckbrunnen B-02 / B-03 ist dicht.", "Der Schluckbrunnen B-02 (2.000 l) ist dicht.",
+    "Der Schluckbrunnen B-02. Danach folgt Herr Sonnwendt.", "B-02;Schluckbrunnen;Familie Sonnwendt",
+    "| B-02 | Schluckbrunnen | Familie Sonnwendt |", "Schluckbrunnen B-02\tFamilie Sonnwendt",
+    "SCHLUCKBRUNNEN B-02 DN 100", "schluckbrunnen B-02 im heizraum", "Der Schluckbrunnen B-02 und der Filter FI-01.",
+    "Der Schluckbrunnen B-02 gehört Bewohnerin Sonnwendt.",  # H-F-1 Verbbindung: frei (SEC-Entscheidpunkt)
+])
+def test_R3c_technische_fortsetzung_bleibt_frei(t):
+    m = re.search(r"[A-Z]{1,4}-\d{1,4}", t)
+    k0, k1 = m.span()
+    frei, ab = _ent(t, [(k0, k1, "LOCATION", "detektor")])
+    assert (k0, k1) in frei, (t, ab)
+
+
+def test_R3c_genitiv_nach_artikel_maskiert():
+    # H-F-1 Genitiv: durch das Ueberspringen des Artikels jetzt maskiert (strenger als 2ddac66, fail-closed)
+    t = "Der Schluckbrunnen B-02 der Familie Sonnwendt ist dicht."
+    k = t.index("B-02")
+    frei, ab = _ent(t, [(k, k + 4, "LOCATION", "detektor")])
+    assert frei == {} and ab[0]["grund"] == "rolle-an-stelle:Familie"
