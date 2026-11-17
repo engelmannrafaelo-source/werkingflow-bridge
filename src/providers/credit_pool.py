@@ -21,7 +21,7 @@ import os
 import uuid
 from contextvars import ContextVar
 import re
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -149,6 +149,16 @@ async def _release_unsent(reservation: str) -> None:
     await _survive_cancel(_finish(reservation, rejected=True))
 
 
+async def _nicht_gesendet(reservation: str, kette: dict | None) -> None:
+    """Belegt nicht gesendet. Ohne Kette wie bisher freigeben. Mit Kette (B1, Root 01a1e624) bleibt die
+    Reserve erhalten und die Zeile wird als unknown/nicht_gesendet markiert; aufloesen darf sie nur der
+    auditierte Betreiberabgleich, nie der Client, nie ein Timeout."""
+    if kette is None:
+        await _release_unsent(reservation)
+    else:
+        await _mark_unknown(reservation, "nicht_gesendet")
+
+
 async def _mark_unknown(reservation: str, reason: str) -> None:
     async def mark():
         try:
@@ -218,6 +228,9 @@ def _opt_in_pruefen(body: dict, anthropic_version: str | None, extra_headers: di
             or kette.get("vorpruefung_c4") is not True or not callable(kette.get("bewerter"))
             or "fallbacks" not in body):
         raise HTTPException(400, "fallback_body_unvertraeglich: incomplete chain contract")
+    if body["fallbacks"] != "default":
+        # A1 (Root 01a1e624): nur der Anbieter-Default; Listen und Ueberschreibungen je Eintrag sind laut verboten.
+        raise HTTPException(400, "fallbacks_liste_nicht_erlaubt: only fallbacks=\"default\" is supported")
     version = anthropic_version or VERSION
     if version not in VERSIONS_ERLAUBT:
         raise HTTPException(400, "fallback_body_unvertraeglich: anthropic-version not allowed")
@@ -262,6 +275,9 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
         if type(uses) is not int or not 1 <= uses <= 3:
             raise HTTPException(400, "Server tools require max_uses between 1 and 3")
         server_steps += uses
+    if kette is not None and server_steps:
+        # A2 (Root 01a1e624): Server-Tool-Gebuehren je Iteration sind nicht belegt -> keine Server-Tools mit Kette.
+        raise HTTPException(400, "server_tools_mit_kette_gesperrt")
     accounts = (await coordinator("GET", "/accounts"))["accounts"]
     pinned = (pin or {}).get("account_id")
     if pinned:
@@ -321,7 +337,7 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
                 if naechstes_konto:
                     continue
                 reserve.update({"fallback_models": list(kette["fallback_models"]), "input_tokens_je_modell": je_modell,
-                                "anthropic_version": version,
+                                "fallbacks_modus": "default", "anthropic_version": version,
                                 "anthropic_beta": zusatz_koepfe.get(KOPF_ERLAUBT[0]),
                                 "kategorienliste_version": kette["kategorienliste_version"]})
             reservation = str(uuid.uuid4())
@@ -332,10 +348,10 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
                 if exc.status_code in (409, 429):
                     continue
                 # A coordinator timeout may still have committed the row.
-                await _release_unsent(reservation)
+                await _nicht_gesendet(reservation, kette)
                 raise
             except asyncio.CancelledError:
-                await _release_unsent(reservation)
+                await _nicht_gesendet(reservation, kette)
                 raise
             # Committed: from here on the pool table has a row for it, whatever
             # its later state (settled / released / unknown).
@@ -345,7 +361,7 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
             try:
                 response = await client.post(API, headers={**headers, **zusatz_koepfe}, json=body)
             except NOT_SENT_ERRORS:
-                await _release_unsent(reservation)
+                await _nicht_gesendet(reservation, kette)
                 raise
             except asyncio.CancelledError:
                 await _mark_unknown(reservation, "cancelled")

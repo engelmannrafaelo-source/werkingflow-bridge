@@ -18,7 +18,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, StrictStr
 
 from src.db.client import get_pool
 from src.pricing import normalize_model_id, price_entry
@@ -31,6 +31,9 @@ ENVELOPE_VERSION = 2
 LAGEN = ("kein_fallback", "fallback_belegt", "sticky_belegt", "abweichung_unbelegt")
 ITER_TYPEN = ("message", "fallback_message")
 TOKEN_FELDER = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+# A4 (Codepruefung R1): Iteration streng, genau diese Schluessel (kein server_tool_use: A2, Server-Tools mit Kette gesperrt).
+ITER_PFLICHT = ("type", "model", *TOKEN_FELDER, "billed")
+ITER_ERLAUBT = frozenset(ITER_PFLICHT)
 
 
 def _fallback_max() -> int | None:
@@ -172,8 +175,10 @@ class Reserve(BaseModel):
     input_tokens: int = Field(ge=0, le=32_000_000, strict=True)
     max_tokens: int = Field(gt=0, le=8_000_000, strict=True)
     # Kette (Server-Fallback). Ohne fallback_models: Vertrag byte-gleich zu vorher.
-    fallback_models: list[str] = Field(default_factory=list)
-    input_tokens_je_modell: dict[str, int] | None = None
+    fallback_models: list[StrictStr] = Field(default_factory=list)
+    input_tokens_je_modell: dict[StrictStr, StrictInt] | None = None
+    # A1 (Root 01a1e624): nur der Anbieter-Default "default"; die Kette ist dann eine Ableitung der Bridge.
+    fallbacks_modus: StrictStr | None = None
     anthropic_version: str | None = None
     anthropic_beta: str | None = None
     kategorienliste_version: str | None = None
@@ -181,7 +186,8 @@ class Reserve(BaseModel):
 
 def _reserve_vertrag(body: Reserve) -> tuple[dict | None, Decimal]:
     """(unveraenderliche Reserve-Envelope oder None, Betrag). Ohne Kette exakt die alte Rechnung."""
-    extra = (body.input_tokens_je_modell, body.anthropic_version, body.anthropic_beta, body.kategorienliste_version)
+    extra = (body.input_tokens_je_modell, body.anthropic_version, body.anthropic_beta, body.kategorienliste_version,
+             body.fallbacks_modus)
     if not body.fallback_models:
         if any(v is not None for v in extra):
             raise HTTPException(400, "Chain fields without fallback_models")
@@ -202,9 +208,14 @@ def _reserve_vertrag(body: Reserve) -> tuple[dict | None, Decimal]:
         raise HTTPException(400, "input_tokens differs from input_tokens_je_modell[model]")
     if not body.kategorienliste_version or not body.anthropic_version:
         raise HTTPException(400, "Chain requires anthropic_version and kategorienliste_version")
+    if body.fallbacks_modus != "default":
+        raise HTTPException(400, "fallbacks_liste_nicht_erlaubt: only fallbacks_modus \"default\"")
     amount = sum((reservation_cost(m, tokens[m], body.max_tokens) for m in kette), Decimal(0))
     vertrag = {"model": body.model, "fallback_models": list(body.fallback_models), "input_tokens_je_modell": tokens,
-               "max_tokens": body.max_tokens, "anthropic_version": body.anthropic_version,
+               "max_tokens": body.max_tokens, "fallbacks_modus": "default",
+               # Kette = Ableitung der Bridge; ein Antwortmodell ausserhalb bleibt der laute Fall (modell_abweichung).
+               "kette_quelle": "ableitung",
+               "anthropic_version": body.anthropic_version,
                "anthropic_beta": body.anthropic_beta, "kategorienliste_version": body.kategorienliste_version,
                "amount_usd": str(amount)}
     return vertrag, amount
@@ -243,54 +254,59 @@ async def reserve(body: Reserve):
     return {"id": str(body.id), "state": "reserved"}
 
 
-class Iteration(BaseModel):
-    type: str
-    model: str
-    input_tokens: int
-    output_tokens: int
-    cache_read_input_tokens: int
-    cache_creation_input_tokens: int
-    # Setzt die Bridge nach ihrer Regel (51c8185c, BERECHNETE_ABLEHNUNGSKATEGORIEN). Der Pool leitet nichts ab.
-    billed: bool | Literal["unbekannt"]
-
-
 class Settle(BaseModel):
     id: UUID
     usage: dict | None = None
     rejected: bool = False
-    iterations: list[Iteration] | None = None
-    lage: str | None = None
-    antwort_iteration: int | None = None
-    kategorienliste_version: str | None = None
+    # A4: Kettenfelder roh annehmen und im Handler streng pruefen, damit JEDER Formfehler als
+    # iterations_ungueltig markiert wird (kein Lax-Umwandeln von "false"/0/"5", kein 422 vor dem Handler).
+    # Je Iteration: type, model, 4 Tokenfelder (int), billed (true|false|"unbekannt"; setzt die Bridge
+    # nach ihrer Regel 51c8185c, der Pool leitet nichts ab). Keine weiteren Schluessel (A2: kein server_tool_use).
+    iterations: Any = None
+    lage: Any = None
+    antwort_iteration: Any = None
+    kategorienliste_version: Any = None
 
 
 def _iterationen_pruefen(vertrag: dict, body: Settle) -> str | None:
     """Form- und Lagepruefung. Rueckgabe: Fehlertext oder None. Keine Ableitung von billed."""
-    its = body.iterations or []
+    its = body.iterations
     kette = [vertrag["model"], *vertrag["fallback_models"]]
     erlaubt = {_norm(m) for m in kette}
-    if body.lage not in LAGEN:
+    if not isinstance(body.lage, str) or body.lage not in LAGEN:
         return "lage_ungueltig"
-    if body.kategorienliste_version != vertrag.get("kategorienliste_version"):
+    if (not isinstance(body.kategorienliste_version, str)
+            or body.kategorienliste_version != vertrag.get("kategorienliste_version")):
         return "kategorienliste_version_abweichend"
+    if not isinstance(its, list):
+        return "iterationen_form"
     if not its or len(its) > len(kette):
         return "iterationen_anzahl"
     for it in its:
-        if it.type not in ITER_TYPEN:
+        if not isinstance(it, dict) or not set(it) <= ITER_ERLAUBT or any(k not in it for k in ITER_PFLICHT):
+            return "iteration_form"
+        if not isinstance(it["type"], str) or it["type"] not in ITER_TYPEN:
             return "iteration_typ"
-        if not it.model or _norm(it.model) not in erlaubt or price_entry(it.model) is None:
+        if not isinstance(it["model"], str) or not it["model"] or _norm(it["model"]) not in erlaubt \
+                or price_entry(it["model"]) is None:
             return "iteration_modell"
-        if any(type(getattr(it, f)) is not int or getattr(it, f) < 0 for f in TOKEN_FELDER):
+        if any(type(it[f]) is not int or it[f] < 0 for f in TOKEN_FELDER):
             return "iteration_tokens"
-        if not (it.billed is True or it.billed is False or it.billed == "unbekannt"):
+        b = it["billed"]
+        if not (b is True or b is False or (isinstance(b, str) and b == "unbekannt")):
             return "iteration_billed"
-    if body.lage == "kein_fallback" and (len(its) != 1 or _norm(its[0].model) != _norm(vertrag["model"])):
+    oben = body.usage if isinstance(body.usage, dict) else {}
+    server = oben.get("server_tool_use")
+    if server is not None and (not isinstance(server, dict) or any(v != 0 for v in server.values())):
+        # A2: Gebuehren je Iteration nicht belegt -> keine Abrechnung von Server-Tools ueber eine Kette.
+        return "server_tool_use_mit_kette"
+    if body.lage == "kein_fallback" and (len(its) != 1 or _norm(its[0]["model"]) != _norm(vertrag["model"])):
         return "lage_kein_fallback_widerspruch"
     if body.antwort_iteration is not None:
-        if not 0 <= body.antwort_iteration < len(its):
+        if type(body.antwort_iteration) is not int or not 0 <= body.antwort_iteration < len(its):
             return "antwort_iteration_ausserhalb"
         oben = body.usage or {}
-        if any(oben.get(f) != getattr(its[body.antwort_iteration], f) for f in TOKEN_FELDER):
+        if any(oben.get(f) != its[body.antwort_iteration][f] for f in TOKEN_FELDER):
             return "top_level_usage_abweichend"
     return None
 
@@ -298,7 +314,7 @@ def _iterationen_pruefen(vertrag: dict, body: Settle) -> str | None:
 def _replay_hash(body: Settle) -> str:
     roh = {"usage": body.usage, "lage": body.lage, "antwort_iteration": body.antwort_iteration,
            "kategorienliste_version": body.kategorienliste_version,
-           "iterations": [it.model_dump() for it in (body.iterations or [])]}
+           "iterations": body.iterations}
     return hashlib.sha256(_kanonisch(roh).encode()).hexdigest()
 
 
@@ -307,27 +323,31 @@ async def _settle_envelope(conn, row, envelope: dict, body: Settle) -> dict:
     unbekannt-Zeilen schliesst kein Client. PV-2: charged_usd >= belegter Betrag."""
     if body.rejected:
         raise HTTPException(409, "rejected_nicht_zulaessig: chain reservation cannot be released by a client")
-    if body.iterations is None:
-        raise HTTPException(422, "Chain reservation requires iterations; reservation retained")
     neu = _replay_hash(body)
     if envelope.get("response") is not None:
         if envelope["response"].get("replay_hash") == neu:
             return {"id": str(body.id), "state": row["state"]}
         log.error("Credit reservation %s: settle_konflikt (different response for an already settled chain)", body.id)
         raise HTTPException(409, "settle_konflikt")
+    if envelope.get("unknown"):
+        # A3/PV-1: nach /unknown oder iterations_ungueltig schliesst kein Client die Zeile; Abschluss nur
+        # ueber den Betreiberabgleich (Anbieterbeleg, Audit, Idempotenz; eigener Auftrag).
+        log.error("Credit reservation %s: settle on a chain row marked unknown refused (operator reconciliation only)",
+                  body.id)
+        raise HTTPException(409, "unbekannt_offen: chain reservation marked unknown; operator reconciliation only")
     if row["state"] != "reserved":
         raise HTTPException(409, "settle_konflikt")
     vertrag = envelope["reserve"]
-    fehler = _iterationen_pruefen(vertrag, body)
+    fehler = "iterationen_fehlen" if body.iterations is None else _iterationen_pruefen(vertrag, body)
     belegt = frei = Decimal(0)
     unbekannt = 0
     if fehler is None:
         try:
             for it in body.iterations:
-                betrag = usage_cost(it.model, {f: getattr(it, f) for f in TOKEN_FELDER})
-                if body.lage == "abweichung_unbelegt" or it.billed == "unbekannt":
+                betrag = usage_cost(it["model"], {f: it[f] for f in TOKEN_FELDER})
+                if body.lage == "abweichung_unbelegt" or it["billed"] == "unbekannt":
                     unbekannt += 1
-                elif it.billed is True:
+                elif it["billed"] is True:
                     belegt += betrag
                 else:
                     frei += betrag
@@ -343,7 +363,7 @@ async def _settle_envelope(conn, row, envelope: dict, body: Settle) -> dict:
     if belegt > reserved:
         log.error("Credit reservation %s: belegt %s USD > Obergrenze %s USD (ueberschreitung_usd=%s)",
                   body.id, belegt, reserved, belegt - reserved)
-    response = {"iterations": [it.model_dump() for it in body.iterations], "lage": body.lage,
+    response = {"iterations": body.iterations, "lage": body.lage,
                 "antwort_iteration": body.antwort_iteration, "usage": body.usage,
                 "kategorienliste_version": body.kategorienliste_version, "belegt_usd": str(belegt),
                 "frei_usd": str(frei), "unbekannt_anzahl": unbekannt, "replay_hash": neu}
@@ -392,7 +412,7 @@ async def settle(body: Settle):
 class Unknown(BaseModel):
     id: UUID
     reason: Literal["cancelled", "transport_error", "http_status", "unreadable_usage", "error",
-                    "modell_abweichung", "bewertung_fehlt"]
+                    "modell_abweichung", "bewertung_fehlt", "nicht_gesendet"]
 
 
 @router.post("/unknown", dependencies=[Depends(authenticate)])
