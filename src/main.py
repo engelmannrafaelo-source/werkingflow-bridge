@@ -1805,6 +1805,7 @@ async def generate_streaming_response(
                     ablehnungsmarke_angekuendigt as _marke_angekuendigt,
                     ist_ablehnung as _ist_ablehnung,
                     ledger_felder as _ledger_felder,
+                    messung_kostenstatus as _messung_kostenstatus,
                 )
                 _vision_empty = not vision_result.content
                 # S0 (Entscheid 4, R2): Ablehnung -> Ablehnungsmarke im letzten
@@ -1880,7 +1881,7 @@ async def generate_streaming_response(
                             "endpoint": "vision",
                             "api_key_lane": vision_result.api_key_lane,
                             "image_count": _vision_images,
-                            **(_ledger_felder(_stream_finish) if _stream_finish else {}),
+                            **(_ledger_felder(_stream_finish) if _stream_finish else _messung_kostenstatus(vision_result.messung)),
                             **vision_result.extra_meta,
                         },
                     )
@@ -4232,9 +4233,6 @@ async def _chat_completions_lauf(
                 status="success",
                 duration_ms=int(duration * 1000),
             )
-            if _direct_finish.get("refusal") and not ablehnungsmarke_angekuendigt(request, request_body):
-                # A1: ohne Ankuendigung nie ein leerer Erfolg (nach der Buchung).
-                raise ablehnung_ohne_marke(_direct_finish)
             if tenant and usage:
                 from src.tenant import track_request_usage
                 await track_request_usage(
@@ -4247,6 +4245,10 @@ async def _chat_completions_lauf(
                     status="success",
                     **direct_attribution
                 )
+            if _direct_finish.get("refusal") and not ablehnungsmarke_angekuendigt(request, request_body):
+                # A1: ohne Ankuendigung nie ein leerer Erfolg — erst nach
+                # Ledger-Buchung UND Tenant-Tracking (Codepruefung R2 B2).
+                raise ablehnung_ohne_marke(_direct_finish)
             response_data["x_backend_info"] = get_backend_info_dict(backend_config)
             if request_body.stream:
                 # The direct path is request/response; expose it as a minimal
@@ -4594,6 +4596,7 @@ async def _chat_completions_lauf(
                         abschluss_felder_sicher as abschluss_felder,
                         ist_ablehnung,
                         ledger_felder,
+                        messung_kostenstatus,
                     )
                     # S0 (Entscheid 4): eine Ablehnung bekommt die
                     # Ablehnungsmarke statt 502 "Retry moeglich".
@@ -4642,7 +4645,7 @@ async def _chat_completions_lauf(
                                 "image_count": image_count,
                                 "stop_reason": vision_result.stop_reason,
                                 "empty_response": not vision_result.content,
-                                **(ledger_felder(_vision_finish) if _vision_finish else {}),
+                                **(ledger_felder(_vision_finish) if _vision_finish else messung_kostenstatus(vision_result.messung)),
                                 # Was der Anbieter ueber SEINEN Aufruf zu sagen
                                 # hat (Gemini: gesetztes Denk-Budget + echte
                                 # Denk-Tokens). E3 liest die Einstellung aus dem

@@ -519,6 +519,13 @@ def _usage_mit_cache(usage: Any) -> Dict[str, int]:
     Werte zum jeweils eigenen Satz rechnen. Bis 17.11.2026 fehlte der Cache
     hier, das Ledger buchte ihn mit 0."""
     u = usage if isinstance(usage, dict) else {}
+    ungueltig = [f for f in _MESSUNG_FELDER if not (type(u.get(f)) is int and u.get(f) >= 0)]
+    if ungueltig:
+        # Codepruefung R2 B1: kein stilles 0. Der Wert bleibt 0 fuer das
+        # Ledger (konservativ, Zeile wird geschrieben), aber die Antwort traegt
+        # cost_status "unbekannt" (UsageMessung.vollstaendig False -> kein
+        # Preis-Kopf, siehe messung_kostenstatus / abschluss_felder).
+        logger.warning("Anthropic-usage unvollstaendig (Felder %s nicht int>=0) — Kosten unbekannt", ungueltig)
     ungecacht = _int0(u.get("input_tokens"))
     lesen = _int0(u.get("cache_read_input_tokens"))
     anlage = _int0(u.get("cache_creation_input_tokens"))
@@ -893,7 +900,9 @@ def abschluss_felder(
             "quelle": quelle,
         })
     f["iterations"] = iterations
-    unbekannt = any(it["billed"] == "unbekannt" for it in iterations)
+    # B1 (Codepruefung R2): eine unvollstaendige Messung ist nie "belegt".
+    unvollstaendig = any("usage_unvollstaendig" in it["cost_basis"]["regel"] for it in iterations)
+    unbekannt = unvollstaendig or any(it["billed"] == "unbekannt" for it in iterations)
     ohne_preis = any(it["billed"] is True and it["cost_eur"] is None for it in iterations)
     # cost_status "unbekannt" heisst: ob der Anbieter berechnet hat, ist nicht
     # belegt (R1). Ein fehlender Preis bei belegter Berechnung macht nur die
@@ -1053,6 +1062,9 @@ def _ledger_felder(finish: Dict[str, Any]) -> Dict[str, Any]:
     }
     if finish.get("cost_status") == "unbekannt":
         meta["cost_art"] = "schaetzung_aus_usage"
+    if finish.get("auswertung_fehler"):
+        # B3 (Codepruefung R2): der Notabschluss ist in der Ledger-Zeile sichtbar.
+        meta["auswertung_fehler"] = finish["auswertung_fehler"]
     if finish.get("refusal"):
         sd = finish.get("stop_details") or {}
         meta["stop_details"] = {
@@ -1062,6 +1074,16 @@ def _ledger_felder(finish: Dict[str, Any]) -> Dict[str, Any]:
             "explanation": (sd.get("explanation")[:300] or None) if isinstance(sd.get("explanation"), str) else None,
         }
     return meta
+
+
+def messung_kostenstatus(messung: Optional[UsageMessung]) -> Dict[str, Any]:
+    """Ledger-Meta fuer eine Antwort ohne x_bridge_finish (Bildweg ohne
+    Ablehnung): bei unvollstaendiger Messung cost_status "unbekannt", damit
+    keine 0-Eingang-Buchung als Preis zum Aufrufer geht (Codepruefung R2 B1).
+    Ohne Messung (Abo-Bildweg) oder vollstaendig: nichts."""
+    if messung is not None and not messung.vollstaendig:
+        return {"cost_status": "unbekannt", "cost_art": "schaetzung_aus_usage", "usage_unvollstaendig": True}
+    return {}
 
 
 def ablehnungs_kopf(finish: Dict[str, Any]) -> Dict[str, str]:
