@@ -52,6 +52,10 @@ KETTEN_TTL_S = 6 * 3600
 KETTEN_TIMEOUT_S = 5.0
 
 _cache: Dict[str, Any] = {"ketten": None, "gelesen_am": None, "gelesen_mono": 0.0}
+#: Lesezaehler fuer die Kontowahl reihum (Abstimmung c9a50d3b, P-1-Abschluss
+#: b4c2767c8078): faellt ein Konto aus, haengt die Kettenerkennung nicht still
+#: an ihm. Der Pool vergibt keine Kontopraeferenz.
+_lesezaehler = {"n": 0}
 _lock = asyncio.Lock()
 
 
@@ -96,12 +100,16 @@ def _vorbedingung() -> Optional[str]:
 
 
 async def _ketten_lesen() -> Dict[str, List[str]]:
-    """allowed_fallback_models per model, from the first pool account (read only)."""
+    """allowed_fallback_models per model, read only, from the pool accounts in
+    turn (read counter mod number of accounts). The key stays in process
+    memory: never logged, never in an error text."""
     from src.providers import credit_pool
     konten = (await credit_pool.coordinator("GET", "/accounts")).get("accounts") or []
     if not konten:
         raise RuntimeError("no pool account to read the Models API")
-    kopf = {"x-api-key": konten[0]["api_key"], "anthropic-version": "2023-06-01",
+    konto = konten[_lesezaehler["n"] % len(konten)]
+    _lesezaehler["n"] += 1
+    kopf = {"x-api-key": konto["api_key"], "anthropic-version": "2023-06-01",
             BETA_KOPF[0]: BETA_KOPF[1]}
     async with httpx.AsyncClient(timeout=KETTEN_TIMEOUT_S) as client:
         antwort = await client.get(MODELS_URL, headers=kopf)
