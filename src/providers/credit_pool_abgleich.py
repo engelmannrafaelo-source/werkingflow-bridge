@@ -15,14 +15,29 @@ Idempotent ueber --abgleich-id; ein zweiter, anderer Abgleich ist ein Konflikt (
 Exit: 0 erledigt/identisch wiederholt, 2 Aufruf/Reservierung unbekannt, 3 nicht abgleichbar/Konflikt,
 4 Beleg ungueltig, 5 DB-Fehler.
 
-Betreiberablauf N (Kanzler-Entscheid Restluecke F, 17.11.2026): Im Worker-Log muss zur Reservierung die Zeile
-``Credit reservation <uuid>: NICHT_GESENDET phase=<p> klasse=<k>`` stehen; sie (mit Host und Zeitstempel) ist
---beleg-ref und muss die UUID enthalten. Steht zur selben ID ``send receipt not stored`` oder irgendeine
-Antwort-/Abrechnungszeile im Log, ist N widerlegt: nicht abgleichen, Reserve bleibt gebunden. Fehlt das
-Worker-Log, ist N nicht zulaessig.
+Betreiberablauf N (Kanzler-Entscheid Restluecke F und F-R2, 17.11.2026):
+1. Im Log ALLER Worker-Instanzen nach der Reservierungs-UUID suchen (``grep <uuid>``), Logger
+   ``src.providers.credit_pool``.
+2. Zulaessig sind zur UUID NUR diese drei Zeilen (jede andere Zeile zur UUID widerlegt N):
+   - ``Credit reservation <uuid>: NICHT_GESENDET phase=<reserve|versand> klasse=<Ausnahmeklasse|None>``
+   - ``Credit reservation <uuid>: request may have reached Anthropic (nicht_gesendet); ...``
+   - ``Credit reservation <uuid>: outcome unknown (nicht_gesendet), marker not stored; ...``
+   Belastbar widerlegt insbesondere ``Credit reservation <uuid>: send receipt not stored ...`` (Versand belegt).
+   Auf dem Erfolgsweg der Kette schreibt der Worker KEINE Zeile mit der UUID; ein Versand zeigt sich also nur
+   ueber den /gesendet-Eintrag an der Zeile (vom Befehl geprueft) oder ueber diese Widerlegungszeile.
+3. Die NICHT_GESENDET-Zeile (mit freiem Praefix fuer Host/Zeitstempel) ist --beleg-ref. Der Befehl prueft:
+   Logformat (Regex), genau diese UUID und keine weitere, phase/klasse gleich phase/detail der gespeicherten
+   Marke, keine Widerlegungszeile (Gross-/Kleinschreibung egal). Was er NICHT pruefen kann: dass die Zeile
+   wirklich im Log steht und dort keine andere Zeile zur UUID; das ist Betreiberpflicht (Audit mit Spur).
+4. Fehlt das Worker-Log zur Zeit der Reservierung, ist N nicht zulaessig; die Reserve bleibt gebunden.
+   Aufbewahrung: das Worker-Log muss mindestens bis zum Abgleich aufbewahrt werden. Vor Aktivierung der Kette
+   am Zielsystem zu belegen: Aufbewahrungsdauer der Worker-Logs und dass ERROR-Zeilen von
+   src.providers.credit_pool dort tatsaechlich ankommen.
 
 Grenze A (A5): Eine Zeile ohne gespeicherte request-id (z. B. billed_unbekannt, deren /gesendet ausfiel) ist
-per A nicht abschliessbar und bleibt auf der Obergrenze (geldsicher).
+per A nicht abschliessbar und bleibt auf der Obergrenze (geldsicher). A1-R2: Traegt die Zeile mehr als eine
+verschiedene request-id (gesendet + unknown), ist A nicht zulaessig (Exit 4): eine Reservierung ist genau eine
+Anbieteranfrage.
 """
 from __future__ import annotations
 
@@ -33,6 +48,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import uuid
@@ -42,6 +58,12 @@ from src.providers.credit_pool_routes import (ENVELOPE_VERSION, NICHT_GESENDET_K
                                               TOKEN_FELDER, _jsonb, beleg_usage_pruefen, usage_cost)
 
 log = logging.getLogger("credit_pool_abgleich")
+
+# F-R2: Logformat der Worker-Zeile (credit_pool._nicht_gesendet), freies Praefix, Endung danach erlaubt.
+UUID_MUSTER = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+NICHT_GESENDET_ZEILE = re.compile(r"Credit reservation (?P<uuid>[0-9a-fA-F-]{36}): NICHT_GESENDET "
+                                  r"phase=(?P<phase>reserve|versand) klasse=(?P<klasse>[A-Za-z]+)(?![A-Za-z0-9_])")
+WIDERLEGUNG = "send receipt not stored"
 
 ERGEBNISSE = ("nicht_gesendet_belegt", "abgerechnet")
 AUDIT_ACTION = "credit_pool.abgleich"
@@ -106,11 +128,20 @@ def _pruefe_n(env: dict, a: dict) -> dict:
     ref = a.get("beleg_ref") or ""
     if not ref:
         raise Abbruch(4, "N abgewiesen: --beleg-ref fehlt")
-    # Restluecke F: die Worker-Logzeile NICHT_GESENDET zu GENAU dieser Reservierung ist der Beleg.
-    if a["reservierung"] not in ref.lower() or "NICHT_GESENDET" not in ref:
-        raise Abbruch(4, "N abgewiesen: --beleg-ref ist nicht die Worker-Logzeile NICHT_GESENDET dieser Reservierung")
-    if "send receipt not stored" in ref:
+    # Restluecke F / F-R2: die Worker-Logzeile NICHT_GESENDET zu GENAU dieser Reservierung, im Logformat,
+    # gebunden an die gespeicherte Marke.
+    if WIDERLEGUNG in ref.lower():
         raise Abbruch(4, "N abgewiesen: Beleg nennt einen Versand (send receipt not stored)")
+    uuids = {x.lower() for x in UUID_MUSTER.findall(ref)}
+    if uuids != {a["reservierung"]}:
+        raise Abbruch(4, "N abgewiesen: --beleg-ref nennt eine fremde oder keine Reservierungs-UUID")
+    treffer = list(NICHT_GESENDET_ZEILE.finditer(ref))
+    if len(treffer) != 1 or treffer[0]["uuid"].lower() != a["reservierung"]:
+        raise Abbruch(4, "N abgewiesen: --beleg-ref ist nicht genau eine Worker-Logzeile NICHT_GESENDET im Logformat")
+    beleg_phase, beleg_klasse = treffer[0]["phase"], treffer[0]["klasse"]
+    for e in unk:
+        if e.get("phase") != beleg_phase or (e.get("detail") or "None") != beleg_klasse:
+            raise Abbruch(4, "N abgewiesen: phase/klasse des Belegs widersprechen der gespeicherten Marke")
     return {"state": "released", "charged": Decimal(0), "belegart": "nicht_gesendet"}
 
 
@@ -130,6 +161,10 @@ def _pruefe_a(env: dict, a: dict) -> dict:
     quellen = [e for e in (env.get("gesendet") or []) + (env.get("unknown") or []) if isinstance(e, dict)]
     if not any(e.get("request_id") == rid for e in quellen):
         raise Abbruch(4, "A abgewiesen: request-id an der Quelle nicht gespeichert")
+    ids = {e.get("request_id") for e in quellen if e.get("request_id") is not None}
+    if len(ids) > 1:
+        # A1-R2: eine Reservierung ist genau eine Anbieteranfrage; keine Abrechnung ueber eine zweite request-id.
+        raise Abbruch(4, f"A abgewiesen: {len(ids)} verschiedene request-ids an der Zeile")
     from fastapi import HTTPException
     try:
         resp = env.get("response")
