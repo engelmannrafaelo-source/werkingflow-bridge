@@ -357,20 +357,6 @@ async def record_usage(
 
     # Compute hypothetical cost if Daemon didn't send it
     hyp_cost = body.hypotheticalCostEur
-    if _claims.kind == "bound":
-        # H-KD-1: gebundene Aufrufer melden keine Kosten selbst. Die Bridge rechnet aus Modell und
-        # Tokens; ein Kostenwert im Body, ein unbepreistes Modell, negative Tokens oder eine fehlende
-        # Lease werden abgewiesen (die Lease-Eigentuemerschaft prueft der Verifier).
-        from src.pricing import is_priced
-        if body.hypotheticalCostEur is not None:
-            raise HTTPException(status_code=422, detail={"error": "bound_cost_selbstmeldung"})
-        if body.leaseId is None:
-            raise HTTPException(status_code=422, detail={"error": "bound_lease_fehlt"})
-        if min(body.inputTokens, body.outputTokens, body.cacheReadTokens, body.cacheCreationTokens) < 0:
-            raise HTTPException(status_code=422, detail={"error": "bound_tokens_negativ"})
-        if not is_priced(body.model):
-            raise HTTPException(status_code=422, detail={"error": "bound_modell_ohne_preis"})
-        hyp_cost = None
     if hyp_cost is None:
         hyp_cost = compute_hypothetical_cost_eur(
             model=body.model,
