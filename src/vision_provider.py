@@ -68,6 +68,15 @@ class VisionResponse:
     # eigene Ledger-Fahrspur statt vision_prepaid und die Finanzierungsfelder.
     api_key_lane: Optional[str] = None
     ledger_meta: Optional[Dict[str, Any]] = None
+    # Nur der Anthropic-Messages-Weg setzt sie (_vision_response_from, S0
+    # Direktweg-Ablehnung 17.11.2026): stop_details roh (Kategorie einer
+    # Ablehnung), Antwortkopf request-id und Body-id des Anbieters, das
+    # gesendete Modell und usage.iterations roh, falls geliefert.
+    stop_details: Optional[Dict[str, Any]] = None
+    provider_request_id: Optional[str] = None
+    provider_message_id: Optional[str] = None
+    requested_model: Optional[str] = None
+    usage_iterations: Optional[List[Dict[str, Any]]] = None
 
 
 class VisionProvider:
@@ -480,9 +489,23 @@ class VisionProvider:
         try:
             result = _vision_response_from(response.json(), model)
             result.credit_meta = credit_meta
+            result.provider_request_id = _request_id_aus(response)
             return result
         except UNREADABLE_RESPONSE_ERRORS as exc:
             raise UpstreamResponseUnreadable("anthropic", exc) from exc
+
+
+def _request_id_aus(response: Any) -> Optional[str]:
+    """Antwortkopf ``request-id`` des Anbieters (Nachweis gegenueber Anthropic).
+    Fehlt er, bleibt er None und wird laut geloggt — nie ein Ersatzwert."""
+    try:
+        wert = response.headers.get("request-id")
+    except AttributeError:
+        wert = None
+    if not wert:
+        logger.warning("Anthropic-Antwort ohne Kopf request-id — provider_request_id bleibt leer")
+        return None
+    return str(wert)
 
 
 def _vision_response_from(data: Dict[str, Any], model: str) -> VisionResponse:
@@ -498,13 +521,17 @@ def _vision_response_from(data: Dict[str, Any], model: str) -> VisionResponse:
     messung = usage_messung_aus(data.get("usage"))
     usage = data.get("usage", {})
 
+    stop_details = data.get("stop_details") if isinstance(data.get("stop_details"), dict) else None
+    iterationen = usage.get("iterations") if isinstance(usage, dict) else None
     log = logger.warning if not response_text else logger.info
     log(
         f"Vision response: {len(response_text)} chars"
         + ("" if response_text else
            f" — EMPTY (stop_reason={data.get('stop_reason')!r}, "
-           f"output_tokens={usage.get('output_tokens', 0)}; vermutlich "
-           f"Thinking hat max_tokens aufgebraucht)"),
+           f"category={(stop_details or {}).get('category')!r}, "
+           f"output_tokens={usage.get('output_tokens', 0)}"
+           + ("; vermutlich Thinking hat max_tokens aufgebraucht)"
+              if data.get("stop_reason") == "max_tokens" else ")")),
         extra={
             "response_length": len(response_text),
             "stop_reason": data.get("stop_reason"),
@@ -523,6 +550,13 @@ def _vision_response_from(data: Dict[str, Any], model: str) -> VisionResponse:
         },
         stop_reason=_stop_reason_or_unknown(data.get("stop_reason")),
         messung=messung,
+        stop_details=stop_details,
+        provider_message_id=data.get("id") if isinstance(data.get("id"), str) else None,
+        requested_model=model,
+        usage_iterations=(
+            [e for e in iterationen if isinstance(e, dict)]
+            if isinstance(iterationen, list) else None
+        ),
     )
 
 
@@ -580,11 +614,328 @@ def ensure_usable_vision_content(content: str, stop_reason: Optional[str]) -> No
     ueber alle Worker und verkleidete den Befund als "at capacity" (dieselbe
     Pathologie wie bei client_request_error dokumentiert).
     """
-    if content:
-        return
     from src.middleware.bridge_error import BridgeError, vision_empty_response_error
 
+    if stop_reason == "refusal":
+        # Waechter (S0, Review A3): eine Ablehnung ist nie verwertbar und nie
+        # wiederholbar. Die regulaeren Aufrufer liefern vorher die
+        # Ablehnungsmarke (abschluss_felder); wer hier ankommt, hat sie
+        # vergessen. Laut und NICHT retrybar — nie 502 "Retry moeglich", nie
+        # eine stille 200-Leerantwort.
+        logger.error("ensure_usable_vision_content: Ablehnung ohne Ablehnungsmarke erreicht den Waechter")
+        from src.middleware.bridge_error import (
+            SOURCE_UPSTREAM_ANTHROPIC, TYPE_UPSTREAM_ERROR, bridge_error,
+        )
+        raise BridgeError(bridge_error(
+            source=SOURCE_UPSTREAM_ANTHROPIC,
+            error_type=TYPE_UPSTREAM_ERROR,
+            reason="modell_abbruch",
+            message=(
+                "Der Anbieter hat die Antwort abgelehnt (stop_reason refusal). "
+                "Nicht wiederholen: eine Ablehnung ist kein Transportfehler."
+            ),
+            status_code=422,
+            retryable_override=False,
+            extra={"fehler_code": "modell_abbruch", "stop_reason": "refusal"},
+        ))
+    if content:
+        return
     raise BridgeError(vision_empty_response_error(stop_reason))
+
+
+
+# ── Ablehnung ehrlich ausweisen (S0, Bridge-Owner 51c8185c, 17.11.2026) ─────
+# Schemaquelle: SCHEMA-ABLEHNUNG-FALLBACK-51c8185c-20261117.md (S-1 bis S-4).
+# Eine Anbieter-Ablehnung (stop_reason "refusal") geht als 200 mit
+# finish_reason content_filter und vollstaendigem x_bridge_finish raus
+# (refusal true, retryable false, verwertbar false) — gleicher Vertrag wie der
+# CLI-Weg (BRREF). Nie umgangen: kein Retry, kein Modellwechsel.
+
+#: Ablehnungskategorien, die der Anbieter auch VOR jeder Ausgabe berechnet.
+#: Einzige Quelle in der Bridge; Pool und Energy referenzieren nur. Aendern
+#: nur mit neuem Doku-Beleg (Datei + sha12) und neuer Version — die Liste
+#: kann sich laut Anbieter aendern.
+BERECHNETE_ABLEHNUNGSKATEGORIEN: Dict[str, Any] = {
+    "version": "2026-11-17",
+    "quelle": (
+        "platform.claude.com/docs/en/build-with-claude/refusals-and-fallback — "
+        "Tabelle 'Billed before any output' und 'How refusals are billed' "
+        "(Stand 'as of September 2026'); Beleg "
+        "BELEG-refusals-and-fallback-doku-20261117.md sha12 d9268d1bf0b6, "
+        "Z. 202-208, 229, 235"
+    ),
+    "gelesen_am": "2026-11-17",
+    "kategorien": ("bio", "frontier_llm", "reasoning_extraction"),
+    "nicht_berechnet_vor_ausgabe": ("cyber", "general_harms", None),
+}
+
+#: Regel V (R3, Review B2): vollstaendig nur, wo der stop_reason es bestimmt.
+_VOLLSTAENDIG_JE_STOP_REASON = {
+    "end_turn": True,
+    "stop_sequence": True,
+    "max_tokens": False,
+    "model_context_window_exceeded": False,
+    "refusal": False,
+}
+
+_WORKER_NAME_FORM = re.compile(r"^[a-z0-9-]{1,40}$")
+_GIT_SHA_FORM = re.compile(r"^[0-9a-f]{40}$")
+_build_sha_cache: Dict[str, Optional[str]] = {}
+
+
+def _modell_kanon(model: Optional[str]) -> Optional[str]:
+    """Gleiche Normalisierung wie pricing.price_entry (Anbieter-IDs, Datums-
+    Suffix): ein Alias und seine datierte ID sind dasselbe Modell (Review B3)."""
+    if not model:
+        return None
+    from src.pricing import normalize_model_id
+    return re.sub(r"-\d{8}$", "", normalize_model_id(model))
+
+
+def _bridge_worker() -> Optional[str]:
+    """Worker-NAME fuer die Diagnose (R8, strenge Lesart): nur Kleinbuchstaben,
+    Ziffern und Bindestrich — nie IP, Pfad oder Hostname mit Punkten."""
+    name = os.getenv("INSTANCE_NAME") or ""
+    return name if _WORKER_NAME_FORM.match(name) else None
+
+
+def _build_sha() -> Optional[str]:
+    if "sha" not in _build_sha_cache:
+        try:
+            from src.version import read_version
+            sha = read_version().git_sha
+        except Exception as e:  # noqa: BLE001 — Diagnosefeld, nie Aufrufabbruch
+            logger.warning("build_sha unbekannt (Build-Metadaten nicht lesbar: %s)", type(e).__name__)
+            sha = None
+        _build_sha_cache["sha"] = sha if sha and _GIT_SHA_FORM.match(sha) else None
+    return _build_sha_cache["sha"]
+
+
+def ist_ablehnung(stop_reason: Optional[str], stop_details: Optional[Dict[str, Any]]) -> bool:
+    return stop_reason == "refusal" or (stop_details or {}).get("type") == "refusal"
+
+
+def _billed_fuer_ablehnung(category: Optional[str], *, kategorie_bekannt: bool) -> Tuple[Any, str]:
+    """billed eines abgelehnten Versuchs (Doku Z. 229, 231, 758; keine
+    Token-Heuristik). Der Direkt- und Bildweg ruft den Anbieter nie als Strom
+    auf; eine Ablehnung ausserhalb der berechneten Kategorien ist daher nicht
+    entscheidbar (vor oder mitten in der Ausgabe) -> "unbekannt", nie False."""
+    if kategorie_bekannt and category in BERECHNETE_ABLEHNUNGSKATEGORIEN["kategorien"]:
+        return True, "kategorie_berechnet"
+    if not kategorie_bekannt:
+        return "unbekannt", "kategorie_fehlt"
+    return "unbekannt", "nicht_streamend_unentscheidbar"
+
+
+def _iterations_kosten(model: Optional[str], tokens: Dict[str, int], billed: Any) -> Tuple[Optional[float], Optional[float]]:
+    """(cost_eur, schaetzung_eur). Preis nur bei billed True und bepreistem
+    Modell (pricing.cost_eur liefert sonst still 0.0)."""
+    from src.pricing import cost_eur, is_priced
+    if not is_priced(model):
+        return None, None
+    betrag = cost_eur(
+        model,
+        tokens.get("input_tokens", 0),
+        tokens.get("output_tokens", 0),
+        cache_read_tokens=tokens.get("cache_read_input_tokens", 0),
+        cache_creation_tokens=tokens.get("cache_creation_input_tokens", 0),
+    )
+    if billed is True:
+        return betrag, None
+    if billed == "unbekannt":
+        return None, betrag
+    return None, None
+
+
+def _token_felder(quelle: Dict[str, Any]) -> Dict[str, int]:
+    return {
+        f: quelle.get(f) if type(quelle.get(f)) is int else 0
+        for f in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    }
+
+
+def abschluss_felder(
+    *,
+    content: str,
+    stop_reason: Optional[str],
+    stop_details: Optional[Dict[str, Any]],
+    requested_model: Optional[str],
+    responding_model: Optional[str],
+    provider_request_id: Optional[str] = None,
+    provider_message_id: Optional[str] = None,
+    messung: Optional[UsageMessung] = None,
+    usage_iterations: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """x_bridge_finish einer Messages-API-Antwort (Schema S-1/S-2).
+
+    Baut auf lauf_abschluss.abschluss_aus_stop_reason(...).details() auf und
+    UEBERSCHREIBT dessen vollstaendig ausdruecklich mit Regel V (Review B2):
+    sonst ergaebe ein fehlender stop_reason, pause_turn oder tool_use ein
+    vollstaendig False, das Energy als Schnitt fortsetzen wuerde."""
+    from src.lauf_abschluss import abschluss_aus_stop_reason
+
+    roh_stop = None if stop_reason in (None, "", "unknown") else stop_reason
+    details = dict(stop_details) if isinstance(stop_details, dict) else None
+    refusal = ist_ablehnung(roh_stop, details)
+    category = (details or {}).get("category") if refusal else None
+
+    f: Dict[str, Any] = abschluss_aus_stop_reason(
+        "refusal" if refusal else roh_stop, category=category,
+    ).details()
+    f.pop("vollstaendig", None)
+    f["stop_reason"] = roh_stop
+    vollstaendig = _VOLLSTAENDIG_JE_STOP_REASON.get("refusal" if refusal else roh_stop)
+    if vollstaendig is None:
+        f["vollstaendig_unbestimmt"] = True
+    else:
+        f["vollstaendig"] = vollstaendig
+    f["refusal"] = refusal
+    f["empty_response"] = not content
+    f["category"] = category
+    f["explanation"] = (details or {}).get("explanation") if refusal else None
+    f["recommended_model"] = (details or {}).get("recommended_model") if refusal else None
+    f["stop_details"] = details
+    f.setdefault("folgezuege", 0)
+    f["provider_request_id"] = provider_request_id
+    f["provider_message_id"] = provider_message_id
+    f["requested_model"] = requested_model
+    f["responding_model"] = responding_model
+
+    # Iterationen: jede gelieferte Position (K3), sonst ein Eintrag aus usage.
+    kv = BERECHNETE_ABLEHNUNGSKATEGORIEN["version"]
+    roh_iter = [e for e in (usage_iterations or []) if isinstance(e, dict)]
+    if roh_iter:
+        quellen = [("iterations", e) for e in roh_iter]
+    else:
+        oben: Dict[str, Any] = {"type": "message", "model": responding_model}
+        if messung is not None and messung.vollstaendig:
+            oben.update(
+                input_tokens=messung.eingabe, output_tokens=messung.ausgabe,
+                cache_read_input_tokens=messung.cache_lesen,
+                cache_creation_input_tokens=messung.cache_anlage,
+            )
+        quellen = [("top_level", oben)]
+    iterations: List[Dict[str, Any]] = []
+    letzte = len(quellen) - 1
+    for i, (quelle, e) in enumerate(quellen):
+        it_model = e.get("model") or responding_model
+        tokens = _token_felder(e)
+        abgelehnt = (i == letzte and refusal) or (i < letzte and e.get("type") == "message")
+        it_category = e.get("category") if "category" in e else (category if i == letzte else None)
+        if abgelehnt:
+            kategorie_bekannt = (
+                "category" in e or (i == letzte and details is not None and "category" in details)
+            )
+            billed, regel = _billed_fuer_ablehnung(it_category, kategorie_bekannt=kategorie_bekannt)
+        else:
+            billed, regel = True, "regulaer"
+        tokens_vollstaendig = quelle == "iterations" or (messung is not None and messung.vollstaendig)
+        if tokens_vollstaendig:
+            cost, schaetzung = _iterations_kosten(it_model, tokens, billed)
+        else:
+            # Keine vollstaendige Messung: keine erfundenen Nullen.
+            tokens = {k: None for k in tokens}
+            cost, schaetzung = None, None
+            regel = regel + "+usage_unvollstaendig"
+        iterations.append({
+            "index": i,
+            "type": e.get("type") or "message",
+            "model": it_model,
+            **tokens,
+            "stop_reason": e.get("stop_reason") if "stop_reason" in e else (roh_stop if i == letzte else None),
+            "category": it_category if abgelehnt else None,
+            "recommended_model": f["recommended_model"] if (abgelehnt and i == letzte) else None,
+            "billed": billed,
+            "cost_eur": cost,
+            "cost_schaetzung_eur": schaetzung,
+            "cost_basis": {"regel": regel, "kategorienliste_version": kv, "preis_modell": it_model},
+            "quelle": quelle,
+        })
+    f["iterations"] = iterations
+    unbekannt = any(it["billed"] == "unbekannt" for it in iterations)
+    ohne_preis = any(it["billed"] is True and it["cost_eur"] is None for it in iterations)
+    # cost_status "unbekannt" heisst: ob der Anbieter berechnet hat, ist nicht
+    # belegt (R1). Ein fehlender Preis bei belegter Berechnung macht nur die
+    # Summe unbekannt, nicht die Berechnung.
+    f["cost_status"] = "unbekannt" if unbekannt else "belegt"
+    f["cost_total_eur"] = (
+        None if (unbekannt or ohne_preis)
+        else round(sum(it["cost_eur"] or 0.0 for it in iterations if it["billed"] is True), 6)
+    )
+    schaetzungen = [it["cost_schaetzung_eur"] for it in iterations if it["cost_schaetzung_eur"] is not None]
+    f["cost_schaetzung_eur"] = round(sum(schaetzungen), 6) if unbekannt and schaetzungen else None
+    f["kategorienliste_version"] = kv
+
+    # Modellvergleich (B3): Alias/datierte ID gelten als gleich.
+    grund = None
+    if _modell_kanon(responding_model) != _modell_kanon(requested_model):
+        grund = "antwortmodell_ungleich_angefragt"
+    elif len(roh_iter) > 1:
+        grund = "iterationen_ohne_fallback"
+    f["modell_abweichung"] = grund is not None
+    f["modell_abweichung_grund"] = grund
+    if grund:
+        logger.error(
+            "Modellabweichung ohne Fallback-Bestellung: angefragt=%s geantwortet=%s iterationen=%d grund=%s",
+            requested_model, responding_model, len(roh_iter), grund,
+        )
+    f["verwertbar"] = not refusal and grund is None
+    f["retryable"] = False if refusal else None
+    f["fallback_angefordert"] = False
+    f["fallback"] = {
+        "lage": "abweichung_unbelegt" if grund else "kein_fallback",
+        "from": None, "to": None, "trigger": None,
+    }
+    f["bridge_worker"] = _bridge_worker()
+    f["build_sha"] = _build_sha()
+    if refusal:
+        logger.warning(
+            "Anbieter-Ablehnung: stop_reason=refusal category=%s request-id=%s modell=%s",
+            category, provider_request_id, responding_model,
+        )
+    return f
+
+
+def ledger_felder(finish: Dict[str, Any]) -> Dict[str, Any]:
+    """provider_metadata-Felder einer Antwort fuer das Ledger. Bei
+    cost_status "unbekannt" ist die Ledger-Zeile nur eine Schaetzung aus usage
+    (R1): ai_call_writer meldet sie dann nie als Preis (Kostenkopf)."""
+    billed_werte = [it.get("billed") for it in finish.get("iterations") or []]
+    if "unbekannt" in billed_werte:
+        billed: Any = "unbekannt"
+    elif billed_werte and all(b is True for b in billed_werte):
+        billed = True
+    elif billed_werte and all(b is False for b in billed_werte):
+        billed = False
+    else:
+        billed = "gemischt" if billed_werte else None
+    meta: Dict[str, Any] = {
+        "stop_reason": finish.get("stop_reason"),
+        "refusal": bool(finish.get("refusal")),
+        "empty_response": bool(finish.get("empty_response")),
+        "refusal_category": finish.get("category"),
+        "provider_request_id": finish.get("provider_request_id"),
+        "billed": billed,
+        "cost_status": finish.get("cost_status"),
+        "kategorienliste_version": finish.get("kategorienliste_version"),
+        "modell_abweichung": bool(finish.get("modell_abweichung")),
+    }
+    if finish.get("cost_status") == "unbekannt":
+        meta["cost_art"] = "schaetzung_aus_usage"
+    if finish.get("refusal"):
+        sd = finish.get("stop_details") or {}
+        meta["stop_details"] = {
+            "type": sd.get("type"),
+            "category": sd.get("category"),
+            "recommended_model": sd.get("recommended_model"),
+            "explanation": (sd.get("explanation") or "")[:300] or None,
+        }
+    return meta
+
+
+def ablehnungs_kopf(finish: Dict[str, Any]) -> Dict[str, str]:
+    """Kopf der Ablehnungsmarke (Variante A)."""
+    return {"X-Bridge-Finish": "content_filter"} if finish.get("refusal") else {}
 
 
 # Singleton instance

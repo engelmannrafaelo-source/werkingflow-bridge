@@ -56,6 +56,14 @@ class VisionResult:
     #: UsageMessung aus der Anthropic-Rohantwort (vision_provider); nur der
     #: Anthropic-Zweig setzt sie, Gemini nie (Test-KI-Deckel, keine Ersatzquelle).
     messung: Optional[Any] = None
+    #: S0 Ablehnung ehrlich ausweisen (Review A1): ohne diese Felder gingen
+    #: Kategorie, request-id und Iterationen hier verloren. Nur der
+    #: Anthropic-Zweig setzt sie; Gemini laesst sie None.
+    stop_details: Optional[Dict[str, Any]] = None
+    provider_request_id: Optional[str] = None
+    provider_message_id: Optional[str] = None
+    requested_model: Optional[str] = None
+    usage_iterations: Optional[List[Dict[str, Any]]] = None
 
 
 def default_vision_target() -> str:
@@ -254,6 +262,11 @@ async def route_to_vision(
         api_key_lane=vision_response.api_key_lane or LANE_ANTHROPIC_PREPAID,
         messung=vision_response.messung,
         extra_meta=vision_response.credit_meta or vision_response.ledger_meta or {},
+        stop_details=vision_response.stop_details,
+        provider_request_id=vision_response.provider_request_id,
+        provider_message_id=vision_response.provider_message_id,
+        requested_model=vision_response.requested_model or model,
+        usage_iterations=vision_response.usage_iterations,
     )
 
 

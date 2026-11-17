@@ -415,7 +415,11 @@ class ChatCompletionResponse(BaseModel):
             "reported it; on finish_reason content_filter also category and folgezuege; "
             "fortsetzungen = the CLI continued the answer past its output limit this "
             "often and content holds every part, joined directly at each seam "
-            "(stop_reason 'max_tokens_fortgesetzt', finish_reason 'stop')"
+            "(stop_reason 'max_tokens_fortgesetzt', finish_reason 'stop'). Direct and "
+            "vision path (Messages API): schema SCHEMA-ABLEHNUNG-FALLBACK (refusal, "
+            "category, provider_request_id, iterations with billed/cost_eur, "
+            "cost_status, verwertbar, retryable, modell_abweichung, bridge_worker, "
+            "build_sha); a refusal is never retryable and never usable"
         ),
     )
     # BRREF (12.10.2026): a CLI run can make several model calls (tool turns,

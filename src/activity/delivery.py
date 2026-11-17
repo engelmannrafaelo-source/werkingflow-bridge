@@ -140,17 +140,28 @@ class DeliveryProbe:
         self._costs[call_uid] = float(cost_eur)
         self._pricing_version = pricing_version
 
+    def note_cost_unbekannt(self, call_uid: str, pricing_version: str) -> None:
+        """A call whose billing by the provider is not established (R1: a
+        refusal outside the billed categories). Its ledger row is only an
+        estimate; it is kept as None so the request reports NO price at all
+        — never the estimate as a price, never a partial sum."""
+        self._costs[call_uid] = None
+        self._pricing_version = pricing_version
+
     @property
     def booked_cost_eur(self) -> Optional[float]:
         """Sum of the ledger prices of this request's calls, or None when the
-        request booked no call at all (then nothing is known — not "free")."""
-        if not self._costs:
+        request booked no call at all, or any call's price is unknown (then
+        nothing is known — not "free", not a partial sum)."""
+        if not self._costs or any(v is None for v in self._costs.values()):
             return None
         return round(sum(self._costs.values()), 6)
 
     def cost_headers(self) -> list:
         cost = self.booked_cost_eur
         if cost is None:
+            if any(v is None for v in self._costs.values()):
+                return [(b"x-bridge-cost-status", b"unbekannt")]
             return []
         return [
             (COST_HEADER.encode(), f"{cost:.6f}".encode()),

@@ -1799,8 +1799,29 @@ async def generate_streaming_response(
                 # Final-Chunk, kein [DONE]); der Fehler folgt nach dem
                 # Ledger-Persist (der Prepaid-Spend ist real).
                 from src.vision_provider import finish_reason_for as _finish_reason_for
+                from src.vision_provider import (
+                    abschluss_felder as _abschluss_felder,
+                    ist_ablehnung as _ist_ablehnung,
+                    ledger_felder as _ledger_felder,
+                )
                 _vision_empty = not vision_result.content
-                if not _vision_empty:
+                # S0 (Entscheid 4, R2): Ablehnung -> Ablehnungsmarke im letzten
+                # Chunk statt event: error mit 502-retryable-Umschlag.
+                _stream_finish = (
+                    _abschluss_felder(
+                        content=vision_result.content,
+                        stop_reason=vision_result.stop_reason,
+                        stop_details=vision_result.stop_details,
+                        requested_model=vision_result.requested_model or request.model,
+                        responding_model=vision_result.model,
+                        provider_request_id=vision_result.provider_request_id,
+                        provider_message_id=vision_result.provider_message_id,
+                        messung=vision_result.messung,
+                        usage_iterations=vision_result.usage_iterations,
+                    )
+                    if _ist_ablehnung(vision_result.stop_reason, vision_result.stop_details) else None
+                )
+                if not _vision_empty and _stream_finish is None:
                     initial_chunk = ChatCompletionStreamResponse(
                         id=request_id,
                         model=vision_result.model,
@@ -1857,6 +1878,7 @@ async def generate_streaming_response(
                             "endpoint": "vision",
                             "api_key_lane": vision_result.api_key_lane,
                             "image_count": _vision_images,
+                            **(_ledger_felder(_stream_finish) if _stream_finish else {}),
                             **vision_result.extra_meta,
                         },
                     )
@@ -1864,6 +1886,18 @@ async def generate_streaming_response(
                     logger.warning(
                         f"⚠️ Vision streaming usage tracking failed (non-fatal): {_vision_track_err}"
                     )
+                if _stream_finish is not None:
+                    # Nach dem Persist: ein einziger Abschluss-Chunk mit der
+                    # Ablehnungsmarke, dann [DONE]. Kein Inhalt, kein Fehler.
+                    _marke_chunk = ChatCompletionStreamResponse(
+                        id=request_id,
+                        model=vision_result.model,
+                        choices=[StreamChoice(index=0, delta={"role": "assistant", "content": ""}, finish_reason="content_filter")],
+                        x_bridge_finish=_stream_finish,
+                    )
+                    yield f"data: {_marke_chunk.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 if _vision_empty:
                     from src.middleware.bridge_error import vision_empty_response_error
                     _empty_env = json.loads(vision_empty_response_error(vision_result.stop_reason).body)
@@ -4109,6 +4143,7 @@ async def _chat_completions_lauf(
                 duration_ms: int, error_code: Optional[str] = None,
                 error_message: Optional[str] = None,
                 cache_read_tokens: int = 0, cache_creation_tokens: int = 0,
+                abschluss_meta: Optional[Dict[str, Any]] = None,
             ) -> None:
                 if status != "success":
                     request.state.ai_call_error_persisted = True
@@ -4134,6 +4169,9 @@ async def _chat_completions_lauf(
                         "usage_source": "anthropic_messages_api",
                         **direct_credit_meta,
                         "user_pinned": bool(user_pinned_provider),
+                        # S0: stop_reason, Ablehnung (Kategorie, request-id),
+                        # billed/cost_status (vision_provider.ledger_felder).
+                        **(abschluss_meta or {}),
                     },
                 )
 
@@ -4161,7 +4199,10 @@ async def _chat_completions_lauf(
             # Rohantwort; sonst bleibt die volle Reservierung stehen.
             await _test_ki_deckel.abrechnen(_test_ki_messung.messung if _test_ki_messung else None)
             logger.info(f"✅ Direct Anthropic request completed in {duration:.2f}s (tier={direct_tier})")
+            from src.vision_provider import ablehnungs_kopf, ledger_felder
+            _direct_finish = response_data.get("x_bridge_finish") or {}
             await _persist_direct_usage(
+                abschluss_meta=ledger_felder(_direct_finish),
                 input_tokens=usage.get("prompt_tokens", 0) or 0,
                 output_tokens=usage.get("completion_tokens", 0) or 0,
                 cache_read_tokens=usage.get("cache_read_input_tokens", 0) or 0,
@@ -4206,6 +4247,10 @@ async def _chat_completions_lauf(
                         "choices": [{"index": 0, "delta": {}, "finish_reason": _finish}],
                         "usage": usage,
                         "x_backend_info": response_data["x_backend_info"],
+                        # Wie der CLI-Strom: x_bridge_finish im letzten Chunk.
+                        # Diese Huelle entsteht NACH der fertigen Antwort und
+                        # ist nie ein Anbieterstrom (billed bleibt wie gemeldet).
+                        "x_bridge_finish": _direct_finish,
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
 
@@ -4216,8 +4261,12 @@ async def _chat_completions_lauf(
                         "Connection": "keep-alive",
                         "X-Backend": "anthropic_direct",
                         "X-Provider-Tier": direct_tier,
+                        **ablehnungs_kopf(_direct_finish),
                     },
                 )
+            if _direct_finish.get("refusal"):
+                # Ablehnungsmarke (Variante A): 200 + content_filter + Kopf.
+                return JSONResponse(content=response_data, headers=ablehnungs_kopf(_direct_finish))
             return response_data
 
         # =======================================================================
@@ -4513,6 +4562,31 @@ async def _chat_completions_lauf(
                             **attribution
                         )
 
+                    from src.vision_provider import (
+                        ablehnungs_kopf,
+                        abschluss_felder,
+                        ist_ablehnung,
+                        ledger_felder,
+                    )
+                    # S0 (Entscheid 4): eine Ablehnung bekommt die
+                    # Ablehnungsmarke statt 502 "Retry moeglich".
+                    _vision_abgelehnt = ist_ablehnung(
+                        vision_result.stop_reason, vision_result.stop_details
+                    )
+                    _vision_finish = (
+                        abschluss_felder(
+                            content=vision_result.content,
+                            stop_reason=vision_result.stop_reason,
+                            stop_details=vision_result.stop_details,
+                            requested_model=vision_result.requested_model or request_body.model,
+                            responding_model=vision_result.model,
+                            provider_request_id=vision_result.provider_request_id,
+                            provider_message_id=vision_result.provider_message_id,
+                            messung=vision_result.messung,
+                            usage_iterations=vision_result.usage_iterations,
+                        )
+                        if _vision_abgelehnt else None
+                    )
                     # Ledger write — vision previously returned here WITHOUT
                     # any usage_events row (only the legacy tenant tracker
                     # above, a no-op without Supabase): the prepaid-key spend
@@ -4541,6 +4615,7 @@ async def _chat_completions_lauf(
                                 "image_count": image_count,
                                 "stop_reason": vision_result.stop_reason,
                                 "empty_response": not vision_result.content,
+                                **(ledger_felder(_vision_finish) if _vision_finish else {}),
                                 # Was der Anbieter ueber SEINEN Aufruf zu sagen
                                 # hat (Gemini: gesetztes Denk-Budget + echte
                                 # Denk-Tokens). E3 liest die Einstellung aus dem
@@ -4553,6 +4628,15 @@ async def _chat_completions_lauf(
                         logger.warning(
                             f"⚠️ Vision usage tracking failed (non-fatal): {_vision_track_err}"
                         )
+
+                    if _vision_finish is not None:
+                        # Ablehnungsmarke (Variante A), nach dem Persist:
+                        # 200, content_filter, x_bridge_finish (refusal,
+                        # retryable false, verwertbar false) und Kopf.
+                        _marke = response.model_dump()
+                        _marke["choices"][0]["finish_reason"] = "content_filter"
+                        _marke["x_bridge_finish"] = _vision_finish
+                        return JSONResponse(content=_marke, headers=ablehnungs_kopf(_vision_finish))
 
                     # FAIL-LOUD fuer leeren Content — BEWUSST erst NACH dem
                     # Ledger-Persist: der Prepaid-Spend ist real und speist
