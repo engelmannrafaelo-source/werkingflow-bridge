@@ -146,6 +146,7 @@ HETZNER_SVC_erkunder_platz_3="docker-erkunder-platz-3-1"
 HETZNER_SVC_erkunder_ausgang="docker-erkunder-ausgang-1"
 source "$(dirname "${BASH_SOURCE[0]}")/erkunder-deploy.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/platform-api-job-gate.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/log-sicherung.sh"
 # platform-api is deployed BEFORE nginx so the upstream resolves when nginx
 # restarts. nginx is last so the new routing is live only after platform-api
 # is healthy.
@@ -1101,6 +1102,13 @@ deploy_one_service() {
             return 1
         fi
     fi
+
+    # Plan V2.1 §11: the container's Docker log dies with the recreate. Secure
+    # and verify it first; without a proven copy there is no recreate.
+    log_sichern "$host" "$container" || {
+        error_ "Log-Sicherung fuer ${container} nicht belegt — ${svc} wird NICHT neu erzeugt"
+        return 1
+    }
 
     # Recreate — NEVER --remove-orphans
     info "Recreating ${svc}..."
@@ -2159,6 +2167,10 @@ phase_rollback() {
             }
         fi
 
+        # Plan V2.1 §11: secure the log here too, but a rollback must repair —
+        # a failed copy is a loud warning, never a reason to stay broken.
+        log_sichern "$host" "$container" || \
+            warn "LOG-SICHERUNG FEHLT: ${container} wird im Rollback OHNE belegte Log-Kopie neu erzeugt (Lücke im Deploy-Log vermerkt)"
         rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} up -d --no-deps --force-recreate ${svc} 2>&1" || {
             error_ "CRITICAL: rollback recreate failed for ${svc}"
             failed=true

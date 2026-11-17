@@ -15,10 +15,22 @@
 # See: /root/orchestrator/workspaces/devops/specs/bridge-platform-split/PLAN.md
 # =============================================================================
 
+# Plan V2.1 §11 (i), Kanzler-Wort 17.11.2026: longer Docker log retention for
+# the containers whose logs Abgleich F needs (platform-api, worker1-4), ~20 days
+# at ~1 MB/h instead of ~30 h. Dev only (this overlay is HETZNER_COMPOSE);
+# /etc/docker/daemon.json (3x10m for everything else) stays untouched. At most
+# 5 x 500 MB on the host. Takes effect when the container is recreated.
+x-logging-lang: &logging-lang
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "10"
+
 services:
   # Workers keep platform.env for budget gate + activity tracking (phase-1).
   # Phase-2: remove env_file from workers once budget gate is an HTTP call.
   worker1:
+    logging: *logging-lang
     env_file:
       - ../secrets/platform.env
       - ../secrets/account-policy.env
@@ -26,6 +38,7 @@ services:
       - bridge-net
       - bridge-prod-net    # access to postgres-prod
   worker2:
+    logging: *logging-lang
     env_file:
       - ../secrets/platform.env
       - ../secrets/account-policy.env
@@ -33,6 +46,7 @@ services:
       - bridge-net
       - bridge-prod-net
   worker3:
+    logging: *logging-lang
     env_file:
       - ../secrets/platform.env
       - ../secrets/account-policy.env
@@ -40,6 +54,7 @@ services:
       - bridge-net
       - bridge-prod-net
   worker4:
+    logging: *logging-lang
     env_file:
       - ../secrets/platform.env
       - ../secrets/account-policy.env
@@ -55,6 +70,7 @@ services:
   #         /v1/db/health, /v1/sandbox/conversations/*
   # =============================================================================
   platform-api:
+    logging: *logging-lang
     build:
       context: ..
       dockerfile: docker/Dockerfile.platform
