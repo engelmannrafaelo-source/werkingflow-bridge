@@ -4252,7 +4252,12 @@ async def _chat_completions_lauf(
                 "cache_creation_tokens": usage.get("cache_creation_tokens", 0) or 0,
             }
             _ledger_model = None
-            if _direct_finish.get("fallback_angefordert") and len(_direct_finish.get("iterations") or []) > 1:
+            # A4 (Codepruefung S1 R1): jede Lage ausser kein_fallback — auch
+            # sticky_belegt mit nur einem Versuch — bucht zum Antwortmodell.
+            if _direct_finish.get("fallback_angefordert") and (
+                (_direct_finish.get("fallback") or {}).get("lage") != "kein_fallback"
+                or len(_direct_finish.get("iterations") or []) > 1
+            ):
                 # S1: Top-Level-usage beschreibt nur den liefernden Versuch
                 # (Doku Z. 758). Eine Ledger-Zeile traegt die Summe aller
                 # berechneten oder unbelegten Versuche zum Modell, das die

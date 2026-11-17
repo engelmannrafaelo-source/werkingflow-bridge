@@ -49,9 +49,15 @@ MODELS_URL = "https://api.anthropic.com/v1/models?limit=100"
 #: 1 + len(allowed_fallback_models).
 ITERATIONEN_DECKEL = 4
 KETTEN_TTL_S = 6 * 3600
+#: Nach einem Fehlschlag wird fruehestens nach dieser Zeit erneut gelesen
+#: (Negativ-Cache, Codepruefung S1 R1 A1): sonst stauen sich Lesungen hinter
+#: dem Lock und /health blockiert.
+KETTEN_FEHLER_BACKOFF_S = 60.0
 KETTEN_TIMEOUT_S = 5.0
 
-_cache: Dict[str, Any] = {"ketten": None, "gelesen_am": None, "gelesen_mono": 0.0}
+_cache: Dict[str, Any] = {"ketten": None, "gelesen_am": None, "gelesen_mono": 0.0,
+                          "fehler_mono": None, "fehler": None}
+_hintergrund: Dict[str, Any] = {"task": None}
 #: Lesezaehler fuer die Kontowahl reihum (Abstimmung c9a50d3b, P-1-Abschluss
 #: b4c2767c8078): faellt ein Konto aus, haengt die Kettenerkennung nicht still
 #: an ihm. Der Pool vergibt keine Kontopraeferenz.
@@ -132,26 +138,54 @@ async def _ketten_lesen() -> Dict[str, List[str]]:
     return ketten
 
 
+def _frisch() -> bool:
+    return _cache["ketten"] is not None and time.monotonic() - _cache["gelesen_mono"] < KETTEN_TTL_S
+
+
+def _im_backoff() -> bool:
+    return _cache["fehler_mono"] is not None and time.monotonic() - _cache["fehler_mono"] < KETTEN_FEHLER_BACKOFF_S
+
+
 async def ketten(*, auffrischen: bool = True) -> Optional[Dict[str, List[str]]]:
-    """Cached chains, refreshed when stale (only if the preconditions hold).
-    None = unknown (logged loud)."""
+    """Chains, only while fresh (TTL). Fail-closed (Codepruefung S1 R1 A1):
+    a stale cache is never used — after the TTL only a successful re-read
+    makes chains known again; a failed read gives None (ketten_unbekannt) and
+    starts a backoff, during which no further read is attempted."""
     if _vorbedingung() is not None:
         return None
-    frisch = _cache["ketten"] is not None and time.monotonic() - _cache["gelesen_mono"] < KETTEN_TTL_S
-    if frisch or not auffrischen:
+    if _frisch():
         return _cache["ketten"]
+    if not auffrischen or _im_backoff():
+        return None
     async with _lock:
-        if _cache["ketten"] is not None and time.monotonic() - _cache["gelesen_mono"] < KETTEN_TTL_S:
+        if _frisch():
             return _cache["ketten"]
+        if _im_backoff():
+            return None
         try:
             gelesen = await _ketten_lesen()
         except Exception as e:  # noqa: BLE001 — unknown chains disable the feature, loud
             logger.error("provider_fallback: Ketten nicht lesbar (%s: %s) — Fallback nicht verfuegbar",
                          type(e).__name__, e)
-            return _cache["ketten"] if _cache["ketten"] is not None else None
-        _cache.update(ketten=gelesen, gelesen_mono=time.monotonic(),
+            _cache.update(ketten=None, fehler_mono=time.monotonic(), fehler=type(e).__name__)
+            return None
+        _cache.update(ketten=gelesen, gelesen_mono=time.monotonic(), fehler_mono=None, fehler=None,
                       gelesen_am=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         return gelesen
+
+
+def auffrischen_im_hintergrund() -> None:
+    """Stoesst eine Lesung an, ohne zu warten (fuer /health). Hoechstens eine
+    laeuft; Fehler setzen den Negativ-Cache (in ketten())."""
+    if _vorbedingung() is not None or _frisch() or _im_backoff():
+        return
+    task = _hintergrund["task"]
+    if task is not None and not task.done():
+        return
+    try:
+        _hintergrund["task"] = asyncio.get_running_loop().create_task(ketten())
+    except RuntimeError:
+        return
 
 
 def kette_fuer(alle: Dict[str, List[str]], model: str) -> Optional[List[str]]:
@@ -164,9 +198,12 @@ async def faehigkeit() -> Dict[str, Any]:
     grund = _vorbedingung()
     alle = None
     if grund is None:
-        alle = await ketten()
+        # Nur der Cache, nie ein wartender Models-GET: /health muss in den
+        # Docker-Healthchecks (5/10 s) sicher antworten (Codepruefung S1 R1 A1).
+        alle = await ketten(auffrischen=False)
         if alle is None:
             grund = "ketten_unbekannt"
+            auffrischen_im_hintergrund()
     mit_kette = {m: z for m, z in (alle or {}).items() if z}
     return {
         "enabled": grund is None,
@@ -179,7 +216,8 @@ async def faehigkeit() -> Dict[str, Any]:
         "fallback_iterationen_max_quelle": "konfiguration (1+3, Doku Z. 504); je Modell 1+len(kette)",
         "ketten": mit_kette,
         "ketten_quelle": "models_api_abgeleitet",
-        "ketten_gelesen_am": _cache["gelesen_am"],
+        "ketten_gelesen_am": _cache["gelesen_am"] if _frisch() else None,
+        "ketten_fehler": _cache["fehler"] if _im_backoff() else None,
         "haiku_ausgenommen": True,
         "kategorienliste_version": BERECHNETE_ABLEHNUNGSKATEGORIEN["version"],
         "build_sha": _build_sha(),

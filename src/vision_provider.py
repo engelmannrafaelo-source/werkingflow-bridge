@@ -990,10 +990,12 @@ def abschluss_felder(
         "from": (erster.get("from") or {}).get("model") if blocks else None,
         "to": (letzter_block.get("to") or {}).get("model") if blocks else None,
         "trigger": (erster.get("trigger") if blocks else None),
-        "bloecke": blocks or None,
     }
-    f["antwort_iteration"] = None if refusal else len(iterations) - 1
     if fallback_kette is not None:
+        # Nur bei Bestellung (Codepruefung S1 R1 A2): ohne Bestellung bleibt
+        # x_bridge_finish byte-gleich zum S0-Stand f3622a5.
+        f["fallback"]["bloecke"] = blocks or None
+        f["antwort_iteration"] = None if refusal else len(iterations) - 1
         f["fallback_kette"] = list(fallback_kette)
     f["bridge_worker"] = _bridge_worker()
     f["build_sha"] = _build_sha()
@@ -1160,7 +1162,7 @@ def fallback_bewerten(antwort: Dict[str, Any], requested_model: str, fallback_ke
     return {
         "iterations": iterations,
         "lage": f["fallback"]["lage"],
-        "antwort_iteration": f["antwort_iteration"],
+        "antwort_iteration": None if f["refusal"] else len(f["iterations"]) - 1,
     }
 
 
