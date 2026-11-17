@@ -14,6 +14,15 @@ Idempotent ueber --abgleich-id; ein zweiter, anderer Abgleich ist ein Konflikt (
 
 Exit: 0 erledigt/identisch wiederholt, 2 Aufruf/Reservierung unbekannt, 3 nicht abgleichbar/Konflikt,
 4 Beleg ungueltig, 5 DB-Fehler.
+
+Betreiberablauf N (Kanzler-Entscheid Restluecke F, 17.11.2026): Im Worker-Log muss zur Reservierung die Zeile
+``Credit reservation <uuid>: NICHT_GESENDET phase=<p> klasse=<k>`` stehen; sie (mit Host und Zeitstempel) ist
+--beleg-ref und muss die UUID enthalten. Steht zur selben ID ``send receipt not stored`` oder irgendeine
+Antwort-/Abrechnungszeile im Log, ist N widerlegt: nicht abgleichen, Reserve bleibt gebunden. Fehlt das
+Worker-Log, ist N nicht zulaessig.
+
+Grenze A (A5): Eine Zeile ohne gespeicherte request-id (z. B. billed_unbekannt, deren /gesendet ausfiel) ist
+per A nicht abschliessbar und bleibt auf der Obergrenze (geldsicher).
 """
 from __future__ import annotations
 
@@ -61,7 +70,8 @@ def _zeile_json(row) -> dict:
 
 
 def eingabe_hash(a: dict) -> str:
-    teile = {k: a.get(k) for k in ("reservierung", "ergebnis", "beleg_ref", "request_id")}
+    # A4: betreiber gehoert dazu (Wiederholung durch einen anderen Betreiber ist kein identischer Aufruf).
+    teile = {k: a.get(k) for k in ("reservierung", "ergebnis", "beleg_ref", "request_id", "betreiber")}
     return hashlib.sha256(json.dumps(teile, sort_keys=True).encode()).hexdigest()
 
 
@@ -93,8 +103,14 @@ def _pruefe_n(env: dict, a: dict) -> dict:
         if phase == "versand" and e.get("detail") in NICHT_GESENDET_KLASSEN:
             continue
         raise Abbruch(4, "N abgewiesen: Phase/Ausnahmeklasse belegt keinen Nichtversand")
-    if not a.get("beleg_ref"):
+    ref = a.get("beleg_ref") or ""
+    if not ref:
         raise Abbruch(4, "N abgewiesen: --beleg-ref fehlt")
+    # Restluecke F: die Worker-Logzeile NICHT_GESENDET zu GENAU dieser Reservierung ist der Beleg.
+    if a["reservierung"] not in ref.lower() or "NICHT_GESENDET" not in ref:
+        raise Abbruch(4, "N abgewiesen: --beleg-ref ist nicht die Worker-Logzeile NICHT_GESENDET dieser Reservierung")
+    if "send receipt not stored" in ref:
+        raise Abbruch(4, "N abgewiesen: Beleg nennt einen Versand (send receipt not stored)")
     return {"state": "released", "charged": Decimal(0), "belegart": "nicht_gesendet"}
 
 
@@ -118,24 +134,31 @@ def _pruefe_a(env: dict, a: dict) -> dict:
     try:
         resp = env.get("response")
         belegt = Decimal(resp["belegt_usd"]) if isinstance(resp, dict) and resp.get("belegt_usd") else Decimal(0)
+        kandidaten = []
         if isinstance(resp, dict) and isinstance(resp.get("iterations"), list):
-            # Konservativ: billed true und "unbekannt" zaehlen, nur das von der Bridge-Regel freigestellte nicht.
-            kosten = _kosten_iterationen(resp["iterations"], True)
-        else:
-            marken = [e for e in env.get("unknown") or [] if isinstance(e, dict) and e.get("request_id") == rid
-                      and e.get("usage") is not None]
-            if not marken:
-                raise Abbruch(4, "A abgewiesen: keine usage der Anbieterantwort gespeichert")
-            usage = marken[-1]["usage"]
+            # Konservativ: billed true und "unbekannt" zaehlen; billed false nur dann weglassen, wenn die Lage
+            # belegt ist. A2: bei abweichung_unbelegt zaehlt /settle jede Iteration als unbekannt -> alle zaehlen.
+            kandidaten.append(_kosten_iterationen(resp["iterations"], resp.get("lage") != "abweichung_unbelegt"))
+        marken = [e for e in env.get("unknown") or [] if isinstance(e, dict) and e.get("request_id") == rid
+                  and e.get("usage") is not None]
+        for marke in marken:
+            # A1: JEDE Marke zur request-id zaehlt, es gilt das Maximum; eine spaetere kleinere senkt nie.
+            usage = marke["usage"]
             if not beleg_usage_pruefen(usage):
                 raise Abbruch(4, "A abgewiesen: usage formal ungueltig")
             if isinstance(usage.get("iterations"), list) and usage["iterations"]:
-                kosten = _kosten_iterationen(usage["iterations"], False)
+                kandidaten.append(_kosten_iterationen(usage["iterations"], False))
             else:
-                model = marken[-1].get("model")
+                model = marke.get("model")
                 if not isinstance(model, str):
                     raise Abbruch(4, "A abgewiesen: Antwortmodell fehlt")
-                kosten = usage_cost(model, {f: usage[f] for f in TOKEN_FELDER})
+                kandidaten.append(usage_cost(model, {f: usage[f] for f in TOKEN_FELDER}))
+        if not kandidaten:
+            raise Abbruch(4, "A abgewiesen: keine usage der Anbieterantwort gespeichert")
+        if len(set(kandidaten)) > 1:
+            log.error("Abgleich %s: %d abweichende Belege zur request-id; es gilt das Maximum", a["reservierung"],
+                      len(kandidaten))
+        kosten = max(kandidaten)
     except HTTPException as exc:
         raise Abbruch(4, f"A abgewiesen: nicht bepreisbar ({exc.detail})") from exc
     except (KeyError, TypeError, ArithmeticError) as exc:
@@ -155,6 +178,12 @@ async def abgleichen(conn, a: dict) -> dict:
     """Ein Abgleich in EINER Transaktion. a: reservierung, abgleich_id, ergebnis, betreiber, beleg_ref, request_id."""
     h = eingabe_hash(a)
     async with conn.transaction():
+        # A3: abgleich_id global eindeutig. Sperre je ID serialisiert parallele Laeufe auf verschiedenen Zeilen.
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "credit_pool.abgleich:" + a["abgleich_id"])
+        fremd = await conn.fetchval("""SELECT target_id FROM audit_log WHERE action=$1 AND metadata->>'abgleich_id'=$2
+            AND target_id <> $3 LIMIT 1""", AUDIT_ACTION, a["abgleich_id"], a["reservierung"])
+        if fremd:
+            raise Abbruch(3, "Konflikt: abgleich_id bereits fuer eine andere Reservierung verwendet")
         row = await conn.fetchrow("SELECT * FROM anthropic_credit_reservations WHERE id=$1 FOR UPDATE",
                                   uuid.UUID(a["reservierung"]))
         if not row:

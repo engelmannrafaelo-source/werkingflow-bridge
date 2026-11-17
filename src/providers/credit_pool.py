@@ -157,8 +157,11 @@ async def _nicht_gesendet(reservation: str, kette: dict | None, phase: str = "ve
     if kette is None:
         await _release_unsent(reservation)
     else:
-        await _mark_unknown(reservation, "nicht_gesendet", phase=phase,
-                            detail=type(exc).__name__ if exc is not None else None)
+        klasse = type(exc).__name__ if exc is not None else None
+        # Restluecke F (Kanzler 17.11.): feste Worker-Logzeile, unabhaengig vom Koordinator. Der Betreiber
+        # gibt sie als --beleg-ref an; "send receipt not stored" oder eine Antwortzeile zur ID widerlegt N.
+        log.error("Credit reservation %s: NICHT_GESENDET phase=%s klasse=%s", reservation, phase, klasse)
+        await _mark_unknown(reservation, "nicht_gesendet", phase=phase, detail=klasse)
 
 
 def _request_id(response: httpx.Response) -> str | None:
@@ -168,14 +171,33 @@ def _request_id(response: httpx.Response) -> str | None:
 
 async def _gesendet(reservation: str, response: httpx.Response) -> None:
     """L2 (Kanzler-Entscheid E3): Versandbeleg sofort nach Eingang der Anbieterantwort festhalten, VOR jeder
-    Abrechnung oder Markierung. Danach ist eine Marke nicht_gesendet fuer diese Zeile widerlegt."""
-    async def schreiben():
-        try:
-            await coordinator("POST", "/gesendet", {"id": reservation, "request_id": _request_id(response),
-                                                    "status": response.status_code})
-        except Exception:
-            log.error("Credit reservation %s: send receipt not stored (request-id kept in later mark)", reservation)
-    await _survive_cancel(schreiben())
+    Abrechnung oder Markierung. Danach ist eine Marke nicht_gesendet fuer diese Zeile widerlegt. Laeuft nur
+    innerhalb von _kette_nachbearbeiten (eine abgeschirmte Aufgabe, K1)."""
+    try:
+        await coordinator("POST", "/gesendet", {"id": reservation, "request_id": _request_id(response),
+                                                "status": response.status_code})
+    except Exception:
+        log.error("Credit reservation %s: send receipt not stored (request-id kept in later mark)", reservation)
+
+
+async def _kette_nachbearbeiten(reservation: str, body: dict, kette: dict, response: httpx.Response) -> None:
+    """K1 (Codepruefung 5f295d8): Versandbeleg UND Abrechnung bzw. Marke einer Kettenantwort in EINER
+    abgeschirmten Aufgabe. Ein Abbruch des Aufrufers nach der bezahlten Antwort laesst die Zeile nie ohne
+    /settle und ohne Marke zurueck."""
+    rid = _request_id(response)
+    await _gesendet(reservation, response)
+    if response.status_code != 200:
+        # Ob mit fallbacks vor einem 4xx schon ein Versuch lief, ist nicht belegt: nie freigeben (auch 5xx).
+        await _mark_unknown(reservation, "http_status", request_id=rid)
+        return
+    try:
+        antwort = response.json()
+        usage = antwort["usage"]
+    except (ValueError, KeyError, TypeError):
+        log.error("Credit reservation %s: unreadable paid response; retained", reservation)
+        await _mark_unknown(reservation, "unreadable_usage", request_id=rid)
+        return
+    await _kette_abrechnen(reservation, body, kette, antwort, usage, rid)
 
 
 async def _mark_unknown(reservation: str, reason: str, **beleg: Any) -> None:
@@ -446,10 +468,11 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
             meta = {"credit_pool_account": account["id"], "credit_pool_org": account["org_id"],
                     "credit_pool_grant": account["grant_id"], "credit_pool_reservation": reservation,
                     "funding_policy": "promotional_only", "automatic_paid_fallback": False}
-            rid = None
             if kette is not None:
-                rid = _request_id(response)
-                await _gesendet(reservation, response)
+                if response.status_code == 200 and pin is not None:
+                    pin.setdefault("account_id", account["id"])
+                await _survive_cancel(_kette_nachbearbeiten(reservation, body, kette, response))
+                return response, meta
             if response.status_code == 200:
                 if pin is not None:
                     pin.setdefault("account_id", account["id"])
@@ -458,16 +481,9 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
                     usage = antwort["usage"]
                 except (ValueError, KeyError, TypeError):
                     log.error("Credit reservation %s: unreadable paid response; retained", reservation)
-                    await _mark_unknown(reservation, "unreadable_usage", request_id=rid)
+                    await _mark_unknown(reservation, "unreadable_usage")
                 else:
-                    if kette is None:
-                        await _survive_cancel(_finish(reservation, usage=usage))
-                    else:
-                        await _kette_abrechnen(reservation, body, kette, antwort, usage, rid)
-                return response, meta
-            if kette is not None and 400 <= response.status_code < 500:
-                # Ob mit fallbacks vor einem 4xx schon ein Versuch lief, ist nicht belegt: nie freigeben.
-                await _mark_unknown(reservation, "http_status", request_id=rid)
+                    await _survive_cancel(_finish(reservation, usage=usage))
                 return response, meta
             if 400 <= response.status_code < 500:
                 await _survive_cancel(_finish(reservation, rejected=True))
@@ -479,7 +495,7 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
                 if exhausted or response.status_code in (401, 403, 429):
                     continue
             else:
-                await _mark_unknown(reservation, "http_status", request_id=rid)
+                await _mark_unknown(reservation, "http_status")
             return response, meta
     if pinned:
         raise PinnedAccountLost(f"pinned credit account {pinned} refused (count/reserve/limit); no switch to "

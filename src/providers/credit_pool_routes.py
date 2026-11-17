@@ -462,6 +462,9 @@ def _beleg(body: "Unknown") -> dict:
     return eintrag
 
 
+GESENDET_MAX = 8
+
+
 class Gesendet(BaseModel):
     id: UUID
     request_id: Any = None
@@ -483,6 +486,18 @@ async def gesendet(body: Gesendet):
         envelope = _jsonb(row.get("usage"))
         if not (isinstance(envelope, dict) and envelope.get("v") == ENVELOPE_VERSION):
             raise HTTPException(400, "send receipt only for chain reservations")
+        # G1 (Codepruefung 5f295d8): nur offene Zeilen; gleiche Belege einmal; hoechstens GESENDET_MAX Eintraege.
+        # Jeder vorhandene Eintrag widerlegt N bereits, ein abgewiesener Zusatz aendert daran nichts.
+        if row["state"] != "reserved":
+            return {"id": str(body.id), "state": row["state"]}
+        bisher = [{"request_id": e.get("request_id"), "status": e.get("status")}
+                  for e in envelope.get("gesendet") or [] if isinstance(e, dict)]
+        if eintrag in bisher:
+            return {"id": str(body.id), "state": row["state"]}
+        if len(bisher) >= GESENDET_MAX:
+            log.error("Credit reservation %s: send receipt limit reached (%s); further receipt not stored",
+                      body.id, GESENDET_MAX)
+            return {"id": str(body.id), "state": row["state"]}
         await conn.execute("""UPDATE anthropic_credit_reservations SET usage = jsonb_set(usage, '{gesendet}',
             COALESCE(usage->'gesendet','[]'::jsonb) || jsonb_build_array($2::jsonb || jsonb_build_object('at',now())))
             WHERE id=$1""", body.id, json.dumps(eintrag))
