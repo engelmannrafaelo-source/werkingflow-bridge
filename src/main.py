@@ -2635,6 +2635,13 @@ async def _schema_noneu_principal_name(request: Request) -> Optional[str]:
     return name if isinstance(name, str) and name else None
 
 
+async def _privacy_anlagenkontext(request: Request, context_hint: Optional[str]) -> bool:
+    """Anlagenkontext fuer die Privacy-Nachbearbeitung — Pruefung in src/privacy_postprocess/anlagenkontext.py."""
+    from src.privacy_postprocess.anlagenkontext import kontext_verifiziert
+    return await kontext_verifiziert(request, context_hint,
+                                     aufrufer_user_id=extract_attribution_context(request).get("user_id"))
+
+
 async def _schema_assert_noneu(request: Request, operator_pin: Optional[str], model_id: Optional[str]) -> None:
     """All three locks of the non-EU test route for THIS request (raises SchemaBedrockExpectationError)."""
     import os as _nx_os
@@ -9591,8 +9598,10 @@ async def _smart_anonymize_core(
         # Antwort als gefiltert ausgeben.
         from src import privacy_postprocess as _pp
         if _pp.ist_aktiv():
+            _anlagenkontext = await _privacy_anlagenkontext(request, context_hint)
             _payload = _pp.postprocess_smart_anonymize(
                 text, _payload, prefix=prefix, known_entities=known_entities,
+                **({"anlagenkontext": True} if _anlagenkontext else {}),
             )
         elif known_entities:
             logger.warning(

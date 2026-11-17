@@ -419,10 +419,16 @@ async def create_job_endpoint(
     # GEPRUEFTER X-Test-Lauf werden darum hier, serverseitig, mit dem Job
     # gespeichert — nie aus dem Rumpf (ein mitgegebener Wert wird entfernt).
     from src.budget.test_ki_deckel import JOB_LAUF_KEY, JOB_PRINZIPAL_KEY
-    attribution = {k: v for k, v in attribution.items() if k not in (JOB_PRINZIPAL_KEY, JOB_LAUF_KEY)}
+    from src.privacy_postprocess.anlagenkontext import JOB_SCHEMA_VERIFIZIERT_KEY
+    attribution = {k: v for k, v in attribution.items()
+                   if k not in (JOB_PRINZIPAL_KEY, JOB_LAUF_KEY, JOB_SCHEMA_VERIFIZIERT_KEY)}
     _principal = getattr(request.state, "principal", None)
     if _principal is not None and not getattr(_principal, "is_legacy", False):
         attribution[JOB_PRINZIPAL_KEY] = _principal.name
+    # Privacy-Anlagenkontext (c9a50d3b 17.11.): die Schema-App ist nur dann serverseitig verifiziert, wenn
+    # der ANLEGENDE Aufruf ueber einen nicht-legacy Principal mit genau dieser einen App kam (nie Kopf/Rumpf).
+    if _schema_job_app(request) == (_SCHEMA_APP_ID, "principal"):
+        attribution[JOB_SCHEMA_VERIFIZIERT_KEY] = True
     if _test_lauf is not None:
         attribution[JOB_LAUF_KEY] = _test_lauf
     attribution = attribution or None

@@ -426,8 +426,13 @@ def postprocess_smart_anonymize(
     prefix: Optional[str] = None,
     known_entities: Optional[Dict[str, str]] = None,
     freiliste: Optional[Freiliste] = None,
+    anlagenkontext: bool = False,
 ) -> Dict[str, Any]:
-    """Nimmt die Antwort des Privacy-Dienstes und gibt eine Antwort derselben Form zurueck."""
+    """Nimmt die Antwort des Privacy-Dienstes und gibt eine Antwort derselben Form zurueck.
+
+    ``anlagenkontext=True`` nur, wenn der Aufrufer (main.py) serverseitig die Schema-App, den
+    deklarierten Anlagenkontext und das Flag belegt hat (siehe anlagenkontext.py). Ohne ihn ist
+    die Ausgabe byte-gleich zum Stand davor."""
     if antwort.get("status") != "success":
         return antwort
     prefix = prefix or "ANON"
@@ -443,7 +448,21 @@ def postprocess_smart_anonymize(
     detektor = spans_aus_antwort(original, anon, mapping_alt, prefix, typen, konf)
     verworfen: Counter = Counter()
     behalten: List[Span] = []
+    herabgestuft: List[Dict[str, Any]] = []
+    if anlagenkontext:
+        from . import anlagenkontext as _ak
+        _regel_vorab = erkenne(original)
+        _hart = [(x.start, x.end) for x in list(detektor) + _regel_vorab if x.type in HARTE_TYPEN]
+        _alle = [(x.start, x.end) for x in list(detektor) + _regel_vorab]
     for s in detektor:
+        if anlagenkontext:
+            _ohne_s = [b for b in _alle if b != (s.start, s.end)]
+            _bauteil = _ak.pruefe(original, s.start, s.end, s.type, s.quelle, _hart, _ohne_s)
+            if _bauteil is not None:
+                verworfen[_ak.GRUND] += 1
+                herabgestuft.append({"original": s.wert(original), "type": s.type, "start": s.start,
+                                     "confidence": s.confidence, "bauteilwort": _bauteil, "grund": _ak.GRUND})
+                continue
         if s.type not in HARTE_TYPEN:
             grund = verwerfen(original, s, fl)
         else:
@@ -502,5 +521,13 @@ def postprocess_smart_anonymize(
             "known_entities_in": len(bekannt),
             "placeholders": len(mapping),
             **stat,
+            **({"anlagenkontext": {
+                "aktiv": True,
+                "herabgestuft": herabgestuft,
+                # Herabgestufte Stellen, die _gleiche_werte_nachziehen wieder maskiert hat (derselbe
+                # Wert steht anderswo als echte Fundstelle) - je Fundstelle, nie globale Wiederherstellung.
+                "wieder_maskiert": sum(1 for h in herabgestuft if any(
+                    x.start <= h["start"] < x.end for x in spans)),
+            }} if anlagenkontext else {}),
         },
     }
