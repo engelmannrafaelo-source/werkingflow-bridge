@@ -50,7 +50,12 @@ log_sicherung_scanner_anheften() {
     if [[ "$host" != "$HETZNER_HOST" ]]; then
         return 0
     fi
-    rssh "$host" "docker image inspect '${LOG_SICHERUNG_GITLEAKS}' >/dev/null 2>&1 && docker tag '${LOG_SICHERUNG_GITLEAKS}' '${LOG_SICHERUNG_GITLEAKS_HALT}'" >/dev/null 2>&1 || true
+    # H6 (18962da3): ein gescheitertes Anheften wird laut gemeldet, haelt aber nicht an; die
+    # Pflicht prueft danach Phase 3.8 per RepoDigest. Fehlt der Scanner, ist das kein
+    # Anheft-Fehler (rc 0, nichts anzuheften): dann meldet 3.8.
+    if ! rssh "$host" "docker image inspect '${LOG_SICHERUNG_GITLEAKS}' >/dev/null 2>&1 || exit 0; docker tag '${LOG_SICHERUNG_GITLEAKS}' '${LOG_SICHERUNG_GITLEAKS_HALT}'" >/dev/null 2>&1; then
+        warn "Log-Sicherung: Scanner auf ${host} NICHT angeheftet (docker tag gescheitert) — der folgende Prune kann ihn loeschen; Phase 3.8 bricht dann ab"
+    fi
     return 0
 }
 
