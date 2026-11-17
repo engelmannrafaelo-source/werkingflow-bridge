@@ -18,7 +18,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, Field, StrictInt, StrictStr
+from pydantic import BaseModel, Field, StrictInt, StrictStr, TypeAdapter, ValidationError
 
 from src.db.client import get_pool
 from src.pricing import normalize_model_id, price_entry
@@ -260,8 +260,11 @@ async def reserve(body: Reserve):
 
 class Settle(BaseModel):
     id: UUID
-    usage: dict | None = None
-    rejected: bool = False
+    # H-1 (Codepruefung 978bb4f R2): roh annehmen. Ohne Kette gilt dieselbe Pruefung wie bisher (_ALT_*, lax wie
+    # Pydantic, 422 ohne Schreibzugriff); bei einer offenen Kettenzeile wird jeder Formfehler als
+    # iterations_ungueltig markiert, statt als FastAPI-422 ohne Marke zu enden.
+    usage: Any = None
+    rejected: Any = False
     # A4: Kettenfelder roh annehmen und im Handler streng pruefen, damit JEDER Formfehler als
     # iterations_ungueltig markiert wird (kein Lax-Umwandeln von "false"/0/"5", kein 422 vor dem Handler).
     # Je Iteration: type, model, 4 Tokenfelder (int), billed (true|false|"unbekannt"; setzt die Bridge
@@ -385,8 +388,47 @@ async def _settle_envelope(conn, row, envelope: dict, body: Settle) -> dict:
     return {"id": str(body.id), "state": state, "unbekannt_anzahl": unbekannt}
 
 
+_ALT_USAGE = TypeAdapter(dict | None)
+_ALT_REJECTED = TypeAdapter(bool)
+
+
+async def _form_markieren(conn, row, envelope: Any, detail: str) -> bool:
+    """H-1: Formfehler einer OFFENEN Kettenzeile sichtbar markieren (wie _settle_envelope bei iterations_ungueltig).
+    Geschlossene oder bereits beantwortete Zeilen bleiben unveraendert."""
+    if not (row and isinstance(envelope, dict) and envelope.get("v") == ENVELOPE_VERSION
+            and row["state"] == "reserved" and envelope.get("response") is None):
+        return False
+    await conn.execute("""UPDATE anthropic_credit_reservations SET usage = jsonb_set(usage, '{unknown}',
+        COALESCE(usage->'unknown','[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+        'reason','iterations_ungueltig','detail',$2::text,'marked_at',now()))) WHERE id=$1""", row["id"], detail)
+    return True
+
+
 @router.post("/settle", dependencies=[Depends(authenticate)])
 async def settle(body: Settle):
+    roh_usage, roh_rejected = body.usage, body.rejected
+    try:
+        body.usage = _ALT_USAGE.validate_python(roh_usage)
+        body.rejected = _ALT_REJECTED.validate_python(roh_rejected)
+        formfehler = None
+    except ValidationError:
+        formfehler = "settle_form:usage/rejected"
+    # Kette streng: auch ein nur lax umwandelbares rejected ("true", 1) ist ein Formfehler.
+    streng = formfehler or (None if type(roh_rejected) is bool else "settle_form:rejected")
+    if streng is not None:
+        markiert = False
+        async with get_pool().acquire() as conn, conn.transaction():
+            row = await conn.fetchrow("SELECT * FROM anthropic_credit_reservations WHERE id=$1 FOR UPDATE", body.id)
+            if row:
+                markiert = await _form_markieren(conn, row, _jsonb(row["usage"]), streng)
+                if not markiert and formfehler is None and isinstance(_jsonb(row["usage"]), dict) \
+                        and _jsonb(row["usage"]).get("v") == ENVELOPE_VERSION:
+                    raise HTTPException(422, "Invalid usage/rejected")
+        if markiert:
+            raise HTTPException(422, f"iterations_ungueltig ({streng}); reservation retained")
+        if formfehler is not None:
+            raise HTTPException(422, "Invalid usage/rejected")
+        # ohne Kette: lax umgewandeltes rejected wie bisher zulaessig, weiter im regulaeren Weg
     if body.rejected == (body.usage is not None):
         raise HTTPException(422, "Provide usage OR a confirmed rejection")
     fehler = None
@@ -396,6 +438,9 @@ async def settle(body: Settle):
             raise HTTPException(404, "Unknown reservation")
         envelope = _jsonb(row["usage"])
         if isinstance(envelope, dict) and envelope.get("v") == ENVELOPE_VERSION:
+            if type(roh_rejected) is not bool:
+                # Zeile wurde zwischen den Transaktionen zur Kette (kann nicht vorkommen): streng ablehnen.
+                raise HTTPException(422, "Invalid usage/rejected")
             result = await _settle_envelope(conn, row, envelope, body)
             fehler = result.pop("_fehler", None)
         else:

@@ -108,8 +108,11 @@ async def coordinator(method: str, path: str, data: dict | None = None) -> dict:
                                      headers={"X-Credit-Pool-Token": token}, json=data)
         if r.status_code != 200:
             # Never log the body: /accounts carries API keys.
-            raise PoolUnavailable(r.status_code if r.status_code in (409, 429) else 503,
-                                  "Anthropic credit coordinator rejected request")
+            fehler = PoolUnavailable(r.status_code if r.status_code in (409, 429) else 503,
+                                     "Anthropic credit coordinator rejected request")
+            # B2: Originalstatus fuer die Kette erhalten (400 = Vertrag/Konfiguration, nicht "Pool kann nicht zahlen").
+            fehler.koordinator_status = r.status_code
+            raise fehler
         return r.json()
     except (httpx.HTTPError, ValueError) as exc:
         raise PoolUnavailable(503, "Anthropic credit coordinator unavailable") from exc
@@ -440,6 +443,14 @@ async def post_messages(body: dict, timeout: float, pin: dict | None = None, *,
             except HTTPException as exc:
                 if exc.status_code in (409, 429):
                     continue
+                if kette is not None and getattr(exc, "koordinator_status", None) == 400:
+                    # B2 (Codepruefung ca6cbcb R1): Der Koordinator hat den Kettenvertrag abgelehnt (Deckel fehlt,
+                    # Kette zu lang, count_tokens_fehlt, unbepreist). /reserve prueft das VOR der Transaktion, es gibt
+                    # also keine Zeile. Laut als Vertragsfehler, NICHT als PoolUnavailable (kein Rueckfall eines
+                    # Aufrufers auf einen anderen Finanzierungsweg). Ohne Kette unveraendert.
+                    log.error("Credit reservation %s: chain contract rejected by coordinator (400); nothing sent",
+                              reservation)
+                    raise HTTPException(400, "pool_kettenvertrag_abgelehnt") from exc
                 # A coordinator timeout may still have committed the row.
                 await _nicht_gesendet(reservation, kette, "reserve", exc)
                 raise
