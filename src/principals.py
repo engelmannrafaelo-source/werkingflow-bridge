@@ -399,7 +399,9 @@ async def bound_spent_eur(bp: "BoundPrincipal") -> "Decimal":
     """Verbrauch seit Anlage, unabhaengig von Selbstmeldungen (H-KD-1):
     je Lease des gebundenen Nutzers/der App = max(serverseitig berechnete Usage dieser Lease,
     Lease-Minuten x BOUND_PAUSCHALE_EUR_PRO_MIN); dazu Usage ohne zuordenbare Lease.
-    Lease-Minuten = leased_at bis Freigabe, Ablauf oder jetzt (das Fruehere), von der Bridge gemessen.
+    Lease-Minuten = leased_at bis Ablauf oder jetzt (das Fruehere), von der Bridge gemessen; eine fruehe
+    Freigabe senkt sie NICHT (Rohtoken bleibt nutzbar). Mit Rohtoken ist das ein Lease-Zeit-Deckel,
+    kein Nutzungsdeckel.
     Kein Cache; DB-Fehler steigen auf (fail-loud -> 5xx, nie ein Lease ohne Pruefung)."""
     from decimal import Decimal
     import uuid as _uuid
@@ -408,8 +410,10 @@ async def bound_spent_eur(bp: "BoundPrincipal") -> "Decimal":
             """
             WITH l AS (
                 SELECT lease_id::text AS lid,
-                       GREATEST(EXTRACT(EPOCH FROM (LEAST(COALESCE(released_at, 'infinity'::timestamptz),
-                                                         expires_at, NOW()) - leased_at)) / 60.0, 0) AS minuten
+                       -- R2 (18962da3 N1): released_at zaehlt NICHT. Der gebundene Aufrufer haelt das rohe
+                       -- OAuth-Token und kann frueh freigeben, das Token bleibt nutzbar. Untergrenze =
+                       -- gewaehrte Lease-Zeit bis Ablauf oder jetzt.
+                       GREATEST(EXTRACT(EPOCH FROM (LEAST(expires_at, NOW()) - leased_at)) / 60.0, 0) AS minuten
                   FROM sandbox_leases
                  WHERE user_id = $1 AND app = $2 AND leased_at >= $3
             ), u AS (
