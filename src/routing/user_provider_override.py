@@ -575,8 +575,15 @@ async def get_user_provider_config(raw_user_id: Any) -> Optional[dict]:
 NON_PROD_APP_ENVS = frozenset({"staging", "local"})
 
 
+#: Staging-Ausnahme NUR fuer den anthropic_direct-Pin des Schema-Generators (Kanzler-Wort F2(a), 17.11.2026):
+#: der synthetische Staging-E2E braucht den Direktweg mit Prod-Schluessel (nie Pool, credit_pool.PROD_KEY_ONLY).
+#: Abgesichert durch die drei Schloesser im Strict-Dispatch (main.py, auch auf der Dev-Bridge) — ohne
+#: SCHEMA_NONEU_TEST_USER_IDS/_PRINCIPALS bleibt er dort 403. Alle anderen Apps und local: unveraendert ignoriert.
+STAGING_DIRECT_PIN_APPS = frozenset({"werking-schema-generator"})
+
+
 def apply_user_provider_override(
-    request_body: Any, config: dict, *, app_env: Optional[str] = None
+    request_body: Any, config: dict, *, app_env: Optional[str] = None, app_id: Optional[str] = None
 ) -> Optional[str]:
     """Mutate the request to honour the user's pin.
 
@@ -660,7 +667,7 @@ def apply_user_provider_override(
 
     # provider == "anthropic": explicit pin to the default backend.
     if provider == "anthropic_direct":
-        if app_env in NON_PROD_APP_ENVS:
+        if app_env in NON_PROD_APP_ENVS and not (app_env == "staging" and app_id in STAGING_DIRECT_PIN_APPS):
             logger.warning(
                 "user_provider_override: anthropic_direct-Pin in app_env=%r "
                 "ignoriert — Call laeuft auf den internen Anthropic-Konten. "
@@ -715,7 +722,11 @@ async def enforce_user_provider_override(request: Any, request_body: Any) -> Opt
 
     app_env = normalize_app_env(get_app_env_from_request(request))
 
-    pinned = apply_user_provider_override(request_body, config, app_env=app_env)
+    # App wie im Schema-Guard aufloesen (exakter Kopf/Principal); nur fuer die Staging-Ausnahme des Direkt-Pins.
+    from src.routing.app_provider_policy import _resolve_app_id
+    app_id, _ = _resolve_app_id(request)
+
+    pinned = apply_user_provider_override(request_body, config, app_env=app_env, app_id=app_id)
     if pinned:
         request.state.user_provider_pinned = pinned
         logger.info(

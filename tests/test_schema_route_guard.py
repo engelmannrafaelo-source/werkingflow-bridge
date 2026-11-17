@@ -275,3 +275,43 @@ def test_pool_for_this_call_flag(monkeypatch):
     finally:
         credit_pool.PROD_KEY_ONLY.reset(tok)
     assert credit_pool.PROD_KEY_ONLY.get() is False
+
+
+# --- F2(a) 17.11.2026: anthropic_direct-Pin auf staging NUR fuer werking-schema-generator ---
+from types import SimpleNamespace  # noqa: E402
+
+from src.routing.user_provider_override import STAGING_DIRECT_PIN_APPS, apply_user_provider_override  # noqa: E402
+
+
+def _body():
+    return SimpleNamespace(backend=None, provider_tier=None, enable_tools=False, bedrock_region=None)
+
+
+def test_staging_direct_pin_only_for_schema_app():
+    assert STAGING_DIRECT_PIN_APPS == frozenset({"werking-schema-generator"})
+    b = _body()
+    assert apply_user_provider_override(b, {"provider": "anthropic_direct"}, app_env="staging",
+                                        app_id="werking-schema-generator") == "anthropic_direct"
+    assert b.provider_tier == "claude-direct-notools"
+
+
+@pytest.mark.parametrize("app_env,app_id", [
+    ("staging", "werking-report"), ("staging", "werking-energy"), ("staging", None), ("staging", ""),
+    ("staging", "Werking-Schema-Generator"),            # exakt, kein Case-Folding
+    ("local", "werking-schema-generator"),               # local bleibt unveraendert ignoriert
+])
+def test_direct_pin_still_ignored_elsewhere_in_non_prod(app_env, app_id):
+    b = _body()
+    assert apply_user_provider_override(b, {"provider": "anthropic_direct"}, app_env=app_env, app_id=app_id) == "anthropic"
+    assert b.provider_tier is None
+
+
+@pytest.mark.parametrize("pin", [{"provider": "bedrock", "region": "eu-central-1"}])
+def test_bedrock_pin_on_staging_unchanged_for_schema_app(pin):
+    b = _body()
+    assert apply_user_provider_override(b, pin, app_env="staging", app_id="werking-schema-generator") == "anthropic"
+
+
+def test_prod_direct_pin_unchanged():
+    b = _body()
+    assert apply_user_provider_override(b, {"provider": "anthropic_direct"}, app_env="prod", app_id="werking-report") == "anthropic_direct"
