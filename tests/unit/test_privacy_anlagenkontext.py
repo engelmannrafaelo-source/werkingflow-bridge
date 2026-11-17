@@ -850,3 +850,66 @@ def test_R3c_genitiv_nach_artikel_maskiert():
     k = t.index("B-02")
     frei, ab = _ent(t, [(k, k + 4, "LOCATION", "detektor")])
     assert frei == {} and ab[0]["grund"] == "rolle-an-stelle:Familie"
+
+
+# ── R3d (SEC verbindlich zu H-F-3, Rafael): Klein-/Versal-Zeilen sperren nur bei echter Rollenbindung ─────────
+
+@pytest.mark.parametrize("t", [
+    "pumpe P-01 ist eingebaut", "PUMPE P-01 IST EINGEBAUT", "pumpe P-01 ist eingebaut.", "pumpe P-01 eingebaut",
+    "pumpe P-01 wurde getauscht", "PUMPE P-01 WURDE GETAUSCHT", "pumpe P-01 ist dicht", "PUMPE P-01 IST DICHT",
+    "pumpe P-01 läuft", "PUMPE P-01 LÄUFT", "pumpe P-01 ist neu", "pumpe P-01 ist kalibriert",
+    "pumpe P-01 hat ole fennimann eingebaut", "PUMPE P-01 HAT OLE FENNIMANN EINGEBAUT",
+    "pumpe P-01 - eingebaut", "PUMPE P-01 (GEPRÜFT)", "pumpe P-01 im heizraum", "pumpe P-01 und filter FI-01",
+])
+def test_R3d_klein_versal_praedikat_erhaelt(t):
+    k = t.index("P-01")
+    frei, ab = _ent(t, [(k, k + 4, "ORGANIZATION", "detektor")])
+    assert (k, k + 4) in frei, (t, ab)
+
+
+@pytest.mark.parametrize("t", [
+    "brunnen B-02, bewohnerin", "brunnen B-02 mieterin", "brunnen B-02 - herr sonnwendt", "brunnen B-02 ist bewohnerin",
+    "brunnen B-02 ist die mieterin", "brunnen B-02 / familie sonnwendt", "brunnen B-02 [mieterin]",
+    "brunnen B-02 der familie sonnwendt", "brunnen B-02 bewohner", "brunnen B-02 ist patientin",
+    "brunnen B-02 hausbewohnerin", "brunnen B-02, sonnwendt", "brunnen B-02 - sonnwendt",
+    "BRUNNEN B-02 - MIETERIN", "BRUNNEN B-02 BEWOHNERIN", "BRUNNEN B-02 IST BEWOHNERIN", "BRUNNEN B-02 / FAMILIE",
+    "BRUNNEN B-02 [MIETERIN]", "BRUNNEN B-02 KOLLEGE", "BRUNNEN B-02, SONNWENDT", "BRUNNEN B-02 DER FAMILIE",
+    "brunnen B-02, angestellte", "brunnen B-02 ist angestellter", "brunnen B-02 - geselle", "BRUNNEN B-02 GENOSSE",
+])
+def test_R3d_klein_versal_rollenbindung_maskiert(t):
+    k = t.index("B-02")
+    frei, ab = _ent(t, [(k, k + 4, "LOCATION", "detektor")])
+    assert frei == {}, (t, ab)
+
+
+def test_R3d_klein_versal_harte_pii_bleibt_maskiert():
+    t = "pumpe P-01 hat ole fennimann eingebaut"
+    r = lauf(t, [("P-01", "ORGANIZATION"), ("ole fennimann", "PERSON")])
+    assert klar(r, "P-01") and maskiert(r, "ole fennimann")
+    t2 = "pumpe P-01 ole fennimann"  # an harter PII haengend
+    k = t2.index("P-01"); p = t2.index("ole")
+    frei, ab = _ent(t2, [(k, k + 4, "ORGANIZATION", "detektor")], hart=[(p, p + len("ole fennimann"))])
+    assert frei == {} and ab[0]["grund"] == "an-harter-pii"
+
+
+@pytest.mark.parametrize("t", [
+    "Brunnen B-02;Kontaktperson Sonnwendt", "Brunnen B-02;Herr Sonnwendt", "Brunnen B-02|Mieterin",
+    "Brunnen B-02,Mieterin", "| Brunnen B-02 | Mieterin |", "Brunnen B-02 ; Mieterin", "Brunnen B-02\tAnsprechpartnerin",
+    "brunnen B-02;herr sonnwendt", "BRUNNEN B-02|MIETERIN",
+])
+def test_R3d_P_PRV_9_marker_in_nachbarzelle_maskiert(t):
+    # Vorbefund e8511fe6 P-PRV-9 (Regression R3c): am Zelltrenner wird die Nachbarzelle auf Marker geprueft
+    k = t.index("B-02")
+    frei, ab = _ent(t, [(k, k + 4, "LOCATION", "detektor")])
+    assert frei == {}, (t, ab)
+
+
+@pytest.mark.parametrize("t", [
+    "Schluckbrunnen B-02;Familie Sonnwendt", "Schluckbrunnen B-02|Sonnwendt", "| Schluckbrunnen B-02 | Ole Sonnwendt |",
+    "Schluckbrunnen B-02\tBewohnerin Sonnwendt", "Schluckbrunnen B-02,Ruecklauf",
+])
+def test_R3d_P_PRV_9_name_ohne_marker_in_nachbarzelle_frei(t):
+    # Zellen sind getrennte Daten: ein Name / Personenwort OHNE Marker in der Nachbarzelle sperrt nicht (Rafael)
+    k = t.index("B-02")
+    frei, ab = _ent(t, [(k, k + 4, "LOCATION", "detektor")])
+    assert (k, k + 4) in frei, (t, ab)
