@@ -33,6 +33,7 @@ from src.api_auth import (
     require_self_or_admin,
     AuthClaims,
 )
+from src.api_auth.deps import require_service_or_bound  # gebundener Lease-Token A
 from src.db.client import get_pool
 from src.budget.gate import enforce_budget
 from src.identity.user_resolver import resolve_user_id, UnresolvableUserIdentity
@@ -156,7 +157,7 @@ class UsageRecordResponse(BaseModel):
 @router.post("/lease-token", response_model=LeaseTokenResponse)
 async def lease_token(
     body: LeaseTokenRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_service_or_bound),
 ):
     # Resolve the billing identity (Bridge UUID, or a licensed email for
     # Engelmann) to the canonical UUID. Fail-fast: a lease must be billable, so
@@ -259,7 +260,7 @@ async def lease_token(
 @router.post("/lease-token/{lease_id}/heartbeat", response_model=HeartbeatResponse)
 async def heartbeat(
     lease_id: uuid.UUID,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_service_or_bound),
 ):
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -274,7 +275,7 @@ async def heartbeat(
 @router.post("/lease-token/{lease_id}/release", response_model=ReleaseResponse)
 async def release(
     lease_id: uuid.UUID,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_service_or_bound),
 ):
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -290,7 +291,7 @@ async def release(
 async def attach_session_endpoint(
     lease_id: uuid.UUID,
     body: AttachSessionRequest,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_service_or_bound),
 ):
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -306,7 +307,7 @@ async def attach_session_endpoint(
 async def record_usage(
     body: UsageRecordRequest,
     request: Request,
-    _claims: AuthClaims = Depends(require_service_token),
+    _claims: AuthClaims = Depends(require_service_or_bound),
 ):
     pool = get_pool()
 

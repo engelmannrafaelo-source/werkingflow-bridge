@@ -51,9 +51,12 @@ psql_on() { # host, sql-on-stdin
 # ── 1. Collect: active rows per host, plus ALL names per host (any state, so
 #      we never re-insert a deliberately deactivated principal). ─────────────
 # Row format: name<TAB>token_hash<TAB>token_prefix<TAB>apps<TAB>paths<TAB>cap
+# Gebundene Principals (proxy_routes nicht leer; ProxyV2/Sandbox-Lease A) werden NIE
+# synchronisiert: sie gelten nur auf dem Host, auf dem sie angelegt wurden. Der Filter
+# ueber to_jsonb funktioniert auch auf Hosts ohne Migration 081 (Spalte fehlt -> 0).
 ACTIVE_SQL="SELECT name || E'\t' || token_hash || E'\t' || token_prefix || E'\t' ||
 array_to_string(allowed_apps, ',') || E'\t' || array_to_string(allowed_paths, ',') || E'\t' ||
-COALESCE(monthly_cap_eur::text, 'NULL') FROM service_principals WHERE active ORDER BY name;"
+COALESCE(monthly_cap_eur::text, 'NULL') FROM service_principals WHERE active AND COALESCE(jsonb_array_length(to_jsonb(service_principals)->'proxy_routes'), 0) = 0 ORDER BY name;"
 ALLNAMES_SQL="SELECT name FROM service_principals ORDER BY name;"
 
 declare -A ACTIVE ALLNAMES

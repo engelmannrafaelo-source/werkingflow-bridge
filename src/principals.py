@@ -176,7 +176,7 @@ async def get_principal_row_by_hash(token_hash: str) -> Optional[dict]:
             """
             SELECT id, name, allowed_apps, allowed_paths, monthly_cap_eur
             FROM service_principals
-            WHERE token_hash = $1 AND active
+            WHERE token_hash = $1 AND active AND cardinality(proxy_routes) = 0
             """,
             token_hash,
         )
@@ -335,3 +335,159 @@ async def list_principals() -> List[dict]:
         }
         for r in rows
     ]
+
+
+# ── Gebundene Tokens (ProxyV2 + Sandbox-Lease A, 17.11.2026) ─────────────────
+# Ein gebundener Principal ist KEIN KI-Principal: get_principal_row_by_hash oben
+# schliesst ihn aus (cardinality(proxy_routes) = 0); auf verify_api_key-Wegen ist
+# sein Token also 401. Er gilt nur ueber den strikten Verifier in
+# src/api_auth/deps.py (Token-Praefix BOUND_TOKEN_PREFIX waehlt den Verifier, das
+# Praefix selbst authentisiert nichts) fuer GENAU EINE App, EINEN Nutzer
+# (proxy_user_id) in EINEM Mandanten (proxy_tenant_id, serverseitige tenants.id)
+# bis proxy_expires_at, nur auf den Routen in proxy_routes ("METHODE /vorlage").
+# Die Code-Obergrenze BOUND_ROUTEN_OBERGRENZE deckelt, was die DB je freigeben kann.
+BOUND_TOKEN_PREFIX = "bpx_"
+BOUND_ROUTEN_OBERGRENZE = frozenset({
+    # ProxyV2 (Works-App): Abo-Gate + eigener Aktivitaetsverlauf
+    "GET /v1/billing/{user_id}/subscriptions",
+    "GET /v1/activity/query",
+    # Sandbox-Lease A (Daemon): eigene Lease, eigener Verbrauch, eigenes Budget, eigene Gespraeche
+    "POST /v1/sandbox/lease-token",
+    "POST /v1/sandbox/lease-token/{lease_id}/heartbeat",
+    "POST /v1/sandbox/lease-token/{lease_id}/release",
+    "POST /v1/sandbox/lease-token/{lease_id}/attach-session",
+    "POST /v1/sandbox/usage/record",
+    "POST /v1/budget/check",
+    "POST /v1/budget/deduct",
+    "GET /v1/sandbox/conversations",
+    "PUT /v1/sandbox/conversations/{conversation_id}",
+    "PUT /v1/sandbox/conversations/{conversation_id}/transcript",
+    "GET /v1/sandbox/conversations/{conversation_id}/transcript",
+    # Identitaet: NUR die eigene E-Mail (Verifier erzwingt email == gebundene Mail)
+    "GET /v1/admin/users/lookup",
+})
+#: allowed_paths eines gebundenen Principals: passt auf keinen KI-Pfad (kein "*", nicht leer).
+BOUND_KEIN_KI_PFAD = "(gebunden)"
+
+
+@dataclass(frozen=True)
+class BoundPrincipal:
+    id: str
+    name: str
+    app_id: str
+    routes: frozenset
+    user_id: str
+    user_email: Optional[str]
+    tenant_id: str
+    user_tenant_id: Optional[str]
+
+
+async def get_bound_principal_by_token(token: str) -> Optional[BoundPrincipal]:
+    """Aktiver, nicht abgelaufener gebundener Principal zum Token, sonst None.
+    Kein Cache: Widerruf (active=false) und Ablauf wirken sofort. Mandant und
+    E-Mail des Nutzers werden bei JEDEM Aufruf aus users gelesen. DB-Fehler
+    werden nicht verschluckt (fail-loud -> 5xx, nie Operator)."""
+    if not is_db_enabled():
+        raise RuntimeError("bound token verification needs the DB")
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT sp.id, sp.name, sp.allowed_apps, sp.proxy_routes, sp.proxy_user_id,
+                   sp.proxy_tenant_id, u.tenant_id AS user_tenant_id, u.email AS user_email
+              FROM service_principals sp
+              LEFT JOIN users u ON u.id = sp.proxy_user_id
+             WHERE sp.token_hash = $1 AND sp.active
+               AND cardinality(sp.proxy_routes) > 0
+               AND sp.proxy_expires_at IS NOT NULL AND sp.proxy_expires_at > NOW()
+            """,
+            hash_token(token),
+        )
+    if row is None or row["proxy_user_id"] is None or not row["proxy_tenant_id"]:
+        return None
+    apps = list(row["allowed_apps"] or [])
+    if len(apps) != 1 or apps[0] == WILDCARD:
+        return None
+    return BoundPrincipal(
+        id=str(row["id"]), name=row["name"], app_id=apps[0],
+        routes=frozenset(row["proxy_routes"] or []) & BOUND_ROUTEN_OBERGRENZE,
+        user_id=str(row["proxy_user_id"]), user_email=row["user_email"],
+        tenant_id=row["proxy_tenant_id"], user_tenant_id=row["user_tenant_id"],
+    )
+
+
+async def bound_owns_lease(bp: BoundPrincipal, lease_id: str) -> bool:
+    """Gehoert die Lease genau diesem Nutzer, Mandanten und dieser App?"""
+    import uuid as _uuid
+    try:
+        lid = _uuid.UUID(str(lease_id))
+    except ValueError:
+        return False
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id, tenant_id, app FROM sandbox_leases WHERE lease_id = $1", lid)
+    return bool(row) and str(row["user_id"]) == bp.user_id and row["tenant_id"] == bp.tenant_id \
+        and row["app"] == bp.app_id
+
+
+async def bound_owns_conversation(bp: BoundPrincipal, conversation_id: str) -> Optional[bool]:
+    """True = eigenes Gespraech, False = fremdes, None = existiert (noch) nicht."""
+    if not conversation_id:
+        return False
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id, tenant_id, app FROM sandbox_conversations WHERE id = $1",
+            str(conversation_id))
+    if row is None:
+        return None
+    return str(row["user_id"]) == bp.user_id and row["tenant_id"] == bp.tenant_id \
+        and row["app"] == bp.app_id
+
+
+def validate_bound_spec(routes: List[str], user_id: str, tenant_id: str,
+                        allowed_apps: List[str]) -> None:
+    """Anlegeregeln (fail-closed, ValueError): genau eine App ohne '*', Routen nicht
+    leer und Teilmenge der Code-Obergrenze, Nutzer- und Mandanten-ID gesetzt."""
+    if len(allowed_apps) != 1 or allowed_apps[0] == WILDCARD:
+        raise ValueError("bound principal needs exactly one app, no '*'")
+    if not routes or any(r not in BOUND_ROUTEN_OBERGRENZE for r in routes):
+        raise ValueError(f"bound routes must be a non-empty subset of {sorted(BOUND_ROUTEN_OBERGRENZE)}")
+    if not user_id or not tenant_id:
+        raise ValueError("bound principal needs proxy_user_id and proxy_tenant_id")
+
+
+def new_bound_token() -> str:
+    import secrets as _secrets
+    return BOUND_TOKEN_PREFIX + _secrets.token_urlsafe(32)
+
+
+async def create_bound_principal(name: str, token: str, app_id: str, routes: List[str],
+                                 user_id: str, tenant_id: str, expires_at) -> dict:
+    """Legt einen gebundenen Principal an. Prueft in DERSELBEN Transaktion, dass
+    der Nutzer existiert und serverseitig zu tenant_id gehoert (keine Slug-Annahme)."""
+    import uuid as _uuid
+    validate_bound_spec(routes, user_id, tenant_id, [app_id])
+    if not token.startswith(BOUND_TOKEN_PREFIX):
+        raise ValueError("bound token must carry the bound prefix")
+    uid = _uuid.UUID(user_id)
+    async with get_pool().acquire() as conn:
+        async with conn.transaction():
+            t = await conn.fetchval("SELECT tenant_id FROM users WHERE id = $1", uid)
+            if t is None or t != tenant_id:
+                raise ValueError("bound user does not exist or does not belong to proxy_tenant_id")
+            row = await conn.fetchrow(
+                """
+                INSERT INTO service_principals
+                    (name, token_hash, token_prefix, allowed_apps, allowed_paths,
+                     proxy_routes, proxy_user_id, proxy_tenant_id, proxy_expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING id, name, allowed_apps, proxy_routes, proxy_user_id,
+                          proxy_tenant_id, proxy_expires_at
+                """,
+                name, hash_token(token), token[:8], [app_id], [BOUND_KEIN_KI_PFAD],
+                sorted(routes), uid, tenant_id, expires_at,
+            )
+    invalidate_cache()
+    return {"id": str(row["id"]), "name": row["name"], "allowed_apps": list(row["allowed_apps"]),
+            "proxy_routes": list(row["proxy_routes"]), "proxy_user_id": str(row["proxy_user_id"]),
+            "proxy_tenant_id": row["proxy_tenant_id"], "proxy_expires_at": row["proxy_expires_at"].isoformat()}
