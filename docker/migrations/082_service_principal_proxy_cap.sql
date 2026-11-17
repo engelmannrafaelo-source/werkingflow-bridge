@@ -17,3 +17,9 @@ ALTER TABLE service_principals ADD CONSTRAINT service_principals_proxy_cap CHECK
     OR (proxy_cap_eur IS NOT NULL AND proxy_cap_eur > 0)
 ) NOT VALID;
 ALTER TABLE service_principals VALIDATE CONSTRAINT service_principals_proxy_cap;
+
+-- H-BT-1 (Review e8511fe6): hoechstens EIN aktiver gebundener Principal je Nutzer und App. Ein abgelaufener,
+-- aber noch aktiver zaehlt mit (Ablauf ist nicht indexierbar); vor einer Neuanlage also widerrufen.
+CREATE UNIQUE INDEX IF NOT EXISTS service_principals_bound_user_app_active_uq
+    ON service_principals (proxy_user_id, (allowed_apps[1]))
+    WHERE active AND cardinality(proxy_routes) > 0;

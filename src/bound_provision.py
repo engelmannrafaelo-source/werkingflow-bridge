@@ -107,7 +107,7 @@ async def pruefe(conn: Any, a: argparse.Namespace) -> List[Dict[str, Any]]:
 
     aktiv = await conn.fetchval(
         "SELECT count(*) FROM service_principals WHERE proxy_user_id = $1 AND active "
-        "AND cardinality(proxy_routes) > 0 AND proxy_expires_at > NOW()", uid) if cols == 5 else None
+        "AND cardinality(proxy_routes) > 0", uid) if cols == 5 else None   # wie Unique-Index 082
     z("kein_aktiver_gebundener_principal", aktiv == 0, aktiv)
     return erg
 
