@@ -2598,6 +2598,52 @@ def enforce_attribution(request: Request) -> dict:
     return attribution
 
 
+async def _schema_noneu_principal_name(request: Request) -> Optional[str]:
+    """Principal that OPENS the private non-EU Schema test route (Pruefung R1 A1).
+
+    Direct call: the authenticated, non-legacy ``request.state.principal``. Job self-call (worker key = legacy):
+    the principal that CREATED the job, stored server-side at POST /v1/jobs (attribution test_ki_prinzipal, never
+    from the body), and only if that job is running and its stored user is this call's user. Anything else -> None.
+    """
+    principal = getattr(request.state, "principal", None)
+    if principal is not None and not getattr(principal, "is_legacy", False):
+        return getattr(principal, "name", None)
+    from src.jobs.selbstaufruf import JOB_LAUF_HEADER
+    job_id = (request.headers.get(JOB_LAUF_HEADER) or "").strip()
+    if not job_id:
+        return None
+    from src.jobs import store_client
+    from src.budget.test_ki_deckel import JOB_PRINZIPAL_KEY
+    try:
+        job = await store_client.get_job(job_id)
+    except Exception as e:  # noqa: BLE001 — not readable: the route stays closed
+        logger.error(f"schema non-EU test: job store not readable ({type(e).__name__}) — principal unknown, refused")
+        return None
+    if not isinstance(job, dict) or job.get("status") != "running":
+        return None
+    attr = job.get("attribution") or {}
+    if attr.get("user_id") != extract_attribution_context(request).get("user_id"):
+        return None
+    name = attr.get(JOB_PRINZIPAL_KEY)
+    return name if isinstance(name, str) and name else None
+
+
+async def _schema_assert_noneu(request: Request, operator_pin: Optional[str], model_id: Optional[str]) -> None:
+    """All three locks of the non-EU test route for THIS request (raises SchemaBedrockExpectationError)."""
+    import os as _nx_os
+    from src.routing.schema_bedrock_guard import (
+        assert_noneu_test_allowed, noneu_test_users, noneu_test_principals,
+        NONEU_TEST_USERS_ENV, NONEU_TEST_PRINCIPALS_ENV,
+    )
+    assert_noneu_test_allowed(
+        operator_pin=operator_pin, model_id=model_id,
+        user_id=extract_attribution_context(request).get("user_id"),
+        noneu_test_users=noneu_test_users(_nx_os.getenv(NONEU_TEST_USERS_ENV)),
+        principal_name=await _schema_noneu_principal_name(request),
+        noneu_test_principals=noneu_test_principals(_nx_os.getenv(NONEU_TEST_PRINCIPALS_ENV)),
+    )
+
+
 def extract_attribution_context(request: Request) -> dict:
     """
     Extract multi-dimension attribution headers from request.
@@ -3616,7 +3662,9 @@ async def _chat_completions_lauf(
                 from src.vertex_eu_service import DEFAULT_ENDPOINT as _SCHEMA_VERTEX_DEFAULT_ENDPOINT
                 from src.routing.schema_bedrock_guard import (
                     noneu_test_users as _schema_noneu_users, NONEU_TEST_USERS_ENV as _SCHEMA_NONEU_ENV,
+                    noneu_test_principals as _schema_noneu_principals, NONEU_TEST_PRINCIPALS_ENV as _SCHEMA_NONEU_PRINC_ENV,
                 )
+                # Nicht-EU-Testweg: assert_schema_expected_route prueft alle drei Schloesser (Pin, Liste, Test-Principal).
                 assert_schema_expected_route(
                     effective_backend=backend_config.backend,
                     operator_pin=operator_pinned_provider,
@@ -3625,6 +3673,8 @@ async def _chat_completions_lauf(
                     vertex_endpoint=(_schema_os.getenv("VERTEX_EU_ENDPOINT") or _SCHEMA_VERTEX_DEFAULT_ENDPOINT),
                     user_id=extract_attribution_context(request).get("user_id"),
                     noneu_test_users=_schema_noneu_users(_schema_os.getenv(_SCHEMA_NONEU_ENV)),
+                    principal_name=await _schema_noneu_principal_name(request),
+                    noneu_test_principals=_schema_noneu_principals(_schema_os.getenv(_SCHEMA_NONEU_PRINC_ENV)),
                 )
             except SchemaBedrockExpectationError as e:
                 raise HTTPException(
@@ -3748,6 +3798,17 @@ async def _chat_completions_lauf(
                     "error": "strict_backend_not_allowed", "appId": "werking-schema-generator",
                     "message": "Dieser Weg ist für die Schemafunktion nicht freigegeben.",
                 })
+            if backend_config.backend == BackendType.ANTHROPIC_DIRECT:
+                # Pruefung R1 H2: der Nicht-EU-Testweg wird hier IM SELBEN REQUEST erneut gegen alle drei Schloesser
+                # geprueft — auch wo der Schema-Guard aus ist (Dev-Bridge ohne Prod-Stempel). Kein Topf gebunden.
+                from src.routing.schema_bedrock_guard import SchemaBedrockExpectationError as _SxErr
+                try:
+                    await _schema_assert_noneu(request, operator_pinned_provider, backend_config.model_id)
+                except _SxErr as e:
+                    raise HTTPException(status_code=403, detail={
+                        "error": "strict_backend_not_allowed", "code": e.code, "appId": "werking-schema-generator",
+                        "message": "Dieser Weg ist für die Schemafunktion nicht freigegeben.",
+                    })
             from src.budget.gate import strict_reserve_pending
             await strict_reserve_pending()
 

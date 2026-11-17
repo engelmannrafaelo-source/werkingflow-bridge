@@ -123,16 +123,19 @@ def test_strict_bound_covers_vertex_price_for_same_tokens():
 
 
 # --- Privater Nicht-EU-Testweg (anthropic_direct), Rafael 17.11.2026: nur Allowlist-Benutzer + Operator-Pin ---
-from src.routing.schema_bedrock_guard import NONEU_TEST_PROVIDER, noneu_test_users  # noqa: E402
+from src.routing.schema_bedrock_guard import NONEU_TEST_PROVIDER, noneu_test_principals, noneu_test_users  # noqa: E402
 
 RAFAEL_TEST = "0f0e0d0c-0b0a-4908-8706-050403020100"
 ANDERER = "11111111-2222-4333-8444-555555555555"
+TEST_PRINCIPAL = "schema-rafael-test"
+PUBLIC_PRINCIPAL = "schema-homepage-prod"
 
 
 def _direct(**kw):
     base = dict(effective_backend=_BT.ANTHROPIC_DIRECT, operator_pin="anthropic_direct", region=None,
                 model_id=EXPECTED_MODEL, vertex_endpoint=None, user_id=RAFAEL_TEST,
-                noneu_test_users=noneu_test_users(RAFAEL_TEST))
+                noneu_test_users=noneu_test_users(RAFAEL_TEST), principal_name=TEST_PRINCIPAL,
+                noneu_test_principals=noneu_test_principals(TEST_PRINCIPAL))
     base.update(kw)
     return assert_schema_expected_route(**base)
 
@@ -167,6 +170,19 @@ def test_noneu_route_requires_direct_pin(pin):
     assert _direct_code(operator_pin=pin) == "schema_requires_matching_operator_pin"
 
 
+@pytest.mark.parametrize("name", [None, "", PUBLIC_PRINCIPAL, "legacy", "*", TEST_PRINCIPAL + "x"])
+def test_noneu_route_requires_own_test_principal(name):
+    # A1: oeffentlicher Homepage-Principal / Legacy oeffnen nie, auch mit Test-UUID in X-User-ID und Pin.
+    assert _direct_code(principal_name=name) == "schema_noneu_test_principal_not_allowed"
+
+
+@pytest.mark.parametrize("raw", [None, "", "legacy", "*", "LEGACY", PUBLIC_PRINCIPAL])
+def test_noneu_route_principal_list_never_admits_legacy(raw):
+    for name in ("legacy", "*", TEST_PRINCIPAL):
+        assert _direct_code(principal_name=name, noneu_test_principals=noneu_test_principals(raw)) \
+            == "schema_noneu_test_principal_not_allowed"
+
+
 def test_noneu_route_model_must_be_approved():
     assert _direct_code(model_id="claude-haiku-5-5") == "schema_route_model_mismatch"
 
@@ -185,3 +201,4 @@ def test_eu_routes_unchanged_by_allowlist():
 
 def test_allowlist_parser_strict():
     assert noneu_test_users(f" {RAFAEL_TEST} , {ANDERER},foo") == frozenset({RAFAEL_TEST, ANDERER})
+    assert noneu_test_principals(f" {TEST_PRINCIPAL} ,legacy,*,a b") == frozenset({TEST_PRINCIPAL})
