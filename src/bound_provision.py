@@ -15,8 +15,9 @@ Aufruf IM Worker-Container der Ziel-Bridge (BRIDGE_DB_URL gesetzt):
 
 Feste Grenzen (SEC 17.11.2026): nur Ziel dev (BRIDGE_ORIGIN_ID == "dev"), nur App werking-works,
 Routen nur aus BOUND_ROUTEN_OBERGRENZE, kurze Ablaufzeit (max. MAX_GUELTIG_STUNDEN), und ein
-strikter Monatsplan mit hartem Deckel ist PFLICHT: ohne passenden Plan, aktive Subscription,
-Monatstopf = Deckel und ohne TopUp-Lots legt das Werkzeug nichts an.
+Kostendeckel --deckel in (0, BOUND_DECKEL_MAX_EUR] ist PFLICHT. Er haengt am Principal selbst
+(Migration 082, proxy_cap_eur), NICHT an plans/subscriptions: ein aktiver werking-works-Plan wuerde
+jeden Works-Nutzer der Bridge unter das Gate stellen (Kanzler-Auflagen 1+2, 17.11.2026).
 """
 from __future__ import annotations
 
@@ -91,56 +92,22 @@ async def pruefe(conn: Any, a: argparse.Namespace) -> List[Dict[str, Any]]:
 
     cols = await conn.fetchval(
         "SELECT count(*) FROM information_schema.columns WHERE table_name = 'service_principals' "
-        "AND column_name IN ('proxy_routes','proxy_user_id','proxy_tenant_id','proxy_expires_at')")
-    z("migration_081", cols == 4, cols)
+        "AND column_name IN ('proxy_routes','proxy_user_id','proxy_tenant_id','proxy_expires_at',"
+        "'proxy_cap_eur')")
+    z("migration_081_082", cols == 5, cols)
 
     u = await conn.fetchrow("SELECT email, tenant_id FROM users WHERE id = $1", uid)
     z("nutzer_existiert", u is not None)
     z("nutzer_email_exakt", u is not None and (u["email"] or "") == a.email)
     z("nutzer_mandant_exakt", u is not None and u["tenant_id"] == a.tenant)
 
+    from src.principals import BOUND_DECKEL_MAX_EUR
     deckel = _deckel(a.deckel)
-    p = await conn.fetchrow(
-        "SELECT app_id::text AS app_id, is_active, interval, is_trial, api_budget_eur, sellable "
-        "FROM plans WHERE id::text = $1", a.plan_id)
-    z("plan_existiert", p is not None, a.plan_id)
-    if p is not None:
-        z("plan_app", p["app_id"] == a.app, p["app_id"])
-        z("plan_aktiv_monat_kein_trial",
-          p["is_active"] is True and p["interval"] == "month" and p["is_trial"] is False)
-        z("plan_deckel", Decimal(str(p["api_budget_eur"])) == deckel, str(p["api_budget_eur"]))
-        z("plan_nicht_verkaeuflich", p["sellable"] is False)
-    n_monat = await conn.fetchval(
-        "SELECT count(*) FROM plans WHERE app_id::text = $1 AND is_active AND NOT is_trial "
-        "AND interval = 'month'", a.app)
-    z("genau_ein_monatsplan_der_app", n_monat == 1, n_monat)
-
-    subs = await conn.fetch(
-        "SELECT plan_id::text AS plan_id FROM subscriptions WHERE user_id = $1 "
-        "AND app_id::text = $2 AND status = 'active'", uid, a.app)
-    z("subscription_aktiv_genau_eine", len(subs) == 1 and subs[0]["plan_id"] == a.plan_id,
-      [s["plan_id"] for s in subs])
-
-    raw = await conn.fetchval("SELECT monthly_budgets FROM user_budgets WHERE user_id = $1", uid)
-    if isinstance(raw, str):
-        raw = json.loads(raw)
-    eintrag = (raw or {}).get(a.plan_id)
-    limit_ok = False
-    if isinstance(eintrag, dict) and "limitEur" in eintrag:
-        try:
-            limit_ok = Decimal(str(eintrag["limitEur"])) == deckel
-        except InvalidOperation:
-            limit_ok = False
-    z("monatstopf_gleich_deckel", limit_ok, eintrag.get("limitEur") if isinstance(eintrag, dict) else None)
-
-    lots = await conn.fetchval(
-        "SELECT count(*) FROM user_topup_lots WHERE user_id = $1 AND expires_at > NOW() "
-        "AND amount_eur > 0", uid)
-    z("keine_topup_lots", lots == 0, lots)
+    z("deckel_bis_max", deckel <= BOUND_DECKEL_MAX_EUR, str(deckel))
 
     aktiv = await conn.fetchval(
         "SELECT count(*) FROM service_principals WHERE proxy_user_id = $1 AND active "
-        "AND cardinality(proxy_routes) > 0 AND proxy_expires_at > NOW()", uid) if cols == 4 else None
+        "AND cardinality(proxy_routes) > 0", uid) if cols == 5 else None   # wie Unique-Index 082
     z("kein_aktiver_gebundener_principal", aktiv == 0, aktiv)
     return erg
 
@@ -174,7 +141,8 @@ async def lauf_anlegen(a: argparse.Namespace) -> int:
         _melde({"modus": "anlegen", "abbruch": "vorbedingung", "pruefungen": erg})
         return 2
     ablauf = datetime.now(timezone.utc) + timedelta(hours=a.gueltig_stunden)
-    neu = await create_bound_principal(a.name, a.app, list(a.routen), a.user_id, a.tenant, ablauf)
+    neu = await create_bound_principal(a.name, a.app, list(a.routen), a.user_id, a.tenant, ablauf,
+                                       _deckel(a.deckel))
     token = neu.pop("token")
     sys.stdout.write(token + "\n")
     sys.stdout.flush()
@@ -225,7 +193,6 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--user-id", required=True)
         p.add_argument("--email", required=True)
         p.add_argument("--tenant", required=True)
-        p.add_argument("--plan-id", required=True)
         p.add_argument("--deckel", required=True)
         p.add_argument("--gueltig-stunden", type=int, required=True)
         p.add_argument("--route", dest="routen", action="append", required=True)

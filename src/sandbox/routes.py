@@ -40,6 +40,18 @@ from src.identity.user_resolver import resolve_user_id, UnresolvableUserIdentity
 from src.sandbox import account_router as _ar
 from src.sandbox import lease_service as _ls
 from src.sandbox.pricing import compute_hypothetical_cost_eur
+from src import principals as _PR
+
+
+async def _bound_cap_gate(request: Request, claims: AuthClaims) -> bool:
+    """True fuer gebundene Aufrufer (Deckel geprueft), False sonst. kind 'bound' ohne Principal = 403."""
+    if claims.kind != "bound":
+        return False
+    bp = getattr(request.state, "bound_principal", None)
+    if bp is None:
+        raise HTTPException(status_code=403, detail={"error": "bound_principal_missing"})
+    await _PR.enforce_bound_cap(bp)
+    return True
 
 logger = logging.getLogger(__name__)
 
@@ -157,8 +169,11 @@ class UsageRecordResponse(BaseModel):
 @router.post("/lease-token", response_model=LeaseTokenResponse)
 async def lease_token(
     body: LeaseTokenRequest,
+    request: Request,
     _claims: AuthClaims = Depends(require_service_or_bound),
 ):
+    # Gebundener Token: Kostendeckel VOR jeder Lease-Arbeit (harter Stopp nach Erschoepfung).
+    bound = await _bound_cap_gate(request, _claims)
     # Resolve the billing identity (Bridge UUID, or a licensed email for
     # Engelmann) to the canonical UUID. Fail-fast: a lease must be billable, so
     # an unresolvable identity is a hard 402 rather than a silent JIT-trial.
@@ -225,7 +240,12 @@ async def lease_token(
             raise HTTPException(status_code=500, detail={"error": "token_file_error", "detail": str(exc)})
 
         # 6. Insert lease
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=body.estimatedDurationMin + 5)
+        dauer_min = body.estimatedDurationMin
+        if bound:
+            # Kurze Laufzeit begrenzt das Ueberschiessen nach Erschoepfung; jede Verlaengerung
+            # (heartbeat) prueft den Deckel erneut.
+            dauer_min = min(dauer_min, _PR.BOUND_LEASE_MAX_MIN)
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=dauer_min + 5)
         lease_id = await _ls.create_lease(
             conn,
             user_id=uid,
@@ -260,8 +280,10 @@ async def lease_token(
 @router.post("/lease-token/{lease_id}/heartbeat", response_model=HeartbeatResponse)
 async def heartbeat(
     lease_id: uuid.UUID,
+    request: Request,
     _claims: AuthClaims = Depends(require_service_or_bound),
 ):
+    await _bound_cap_gate(request, _claims)
     pool = get_pool()
     async with pool.acquire() as conn:
         new_expires_at = await _ls.heartbeat_lease(conn, lease_id)
