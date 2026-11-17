@@ -43,9 +43,16 @@ class ExecutorHTTPError(RuntimeError):
         dependency: Optional[str] = None,
         retryable: Optional[bool] = None,
         details: Optional[Dict[str, Any]] = None,
+        ablehnung: Optional[Dict[str, Any]] = None,
+        usage_felder: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(message)
         self.status_code = status_code
+        # E3-1: a refused self-call (422 modell_abbruch) keeps x_bridge_finish /
+        # category / provider_request_id and the tokens of its iterations
+        # (error_contract.ablehnung_aus_antwort); None for every other error.
+        self.ablehnung = ablehnung
+        self.usage_felder = usage_felder
         # fehler_code / antwort_ende / session_id of the endpoint's error
         # answer (error_contract.JOB_ERROR_DETAIL_KEYS, JOBENDE).
         self.details = details or {}
@@ -83,12 +90,14 @@ def _http_error(response: Any, message: str, rejection: Optional[str]) -> "Execu
     """A self-call's non-2xx answer as a job error that keeps the endpoint's
     own verdict (retryable / retry_after_s from its envelope) and what it says
     about the run (fehler_code / antwort_ende / session_id)."""
-    from src.error_contract import envelope_fields
+    from src.error_contract import ablehnung_aus_antwort, envelope_fields
 
     try:
-        verdict = envelope_fields(response.json())
+        body = response.json()
     except Exception:
-        verdict = {}
+        body = None
+    verdict = envelope_fields(body)
+    abgelehnt = ablehnung_aus_antwort(body) or {}
     retry_after = verdict.get("retry_after_s")
     if retry_after is None:
         retry_after = _retry_after_s(response)
@@ -99,6 +108,8 @@ def _http_error(response: Any, message: str, rejection: Optional[str]) -> "Execu
         rejection=rejection,
         retryable=verdict.get("retryable"),
         details=_response_details(response),
+        ablehnung=abgelehnt.get("ablehnung"),
+        usage_felder=abgelehnt.get("usage_felder"),
     )
 
 

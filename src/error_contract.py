@@ -62,6 +62,15 @@ UNCLASSIFIED_RETRYABLE = False
 # the error row next to message/code, only when set.
 JOB_ERROR_DETAIL_KEYS = ("fehler_code", "antwort_ende", "session_id")
 
+# What a job error keeps of a provider REFUSAL (E3-1, 17.11.2026). A chat job
+# whose caller did not announce the refusal mark gets the endpoint's 422
+# modell_abbruch; its error object carried x_bridge_finish (category, request
+# id, per-iteration tokens), but the job error kept only fehler_code, so a
+# /v1/jobs caller could neither name the category nor book the tokens. Stored
+# flat in the error row, next to `usage` (summed from the iterations). Only
+# diagnosis the direct caller sees anyway — no prompt, no answer text.
+JOB_ERROR_ABLEHNUNG_KEYS = ("x_bridge_finish", "category", "provider_request_id")
+
 
 def is_retryable_status(status_code: int) -> bool:
     """Rule 2: the verdict for an HTTP status nobody classified explicitly."""
@@ -100,6 +109,63 @@ def job_usage_fields(exc: BaseException) -> Dict[str, Any]:
     """usage / usage_fehlt for the job error row, {} when the failure has none."""
     felder = getattr(exc, "usage_felder", None)
     return dict(felder) if isinstance(felder, dict) else {}
+
+
+def job_ablehnung_fields(exc: BaseException) -> Dict[str, Any]:
+    """JOB_ERROR_ABLEHNUNG_KEYS of a refused self-call, {} for any other failure."""
+    felder = getattr(exc, "ablehnung", None)
+    if not isinstance(felder, dict):
+        return {}
+    return {k: felder[k] for k in JOB_ERROR_ABLEHNUNG_KEYS if felder.get(k) is not None}
+
+
+def ablehnung_aus_antwort(body: Any) -> Optional[Dict[str, Any]]:
+    """{"ablehnung": {...}, "usage_felder": {...}} from a 422 modell_abbruch body
+    that carries x_bridge_finish (vision_provider.ablehnung_ohne_marke); None
+    for every other answer. Values are type-checked, never guessed:
+      * x_bridge_finish only as a mapping, category / provider_request_id only
+        as text;
+      * usage = sum over x_bridge_finish.iterations when EVERY iteration has
+        integer input_tokens and output_tokens; otherwise usage_fehlt (a
+        refusal was usually paid — "no tokens known" must not read as 0).
+    cost_eur stays unknown (no ledger price on this path); cost_status is the
+    one the refusal itself states."""
+    if not isinstance(body, dict):
+        return None
+    err = body.get("error") if isinstance(body.get("error"), dict) else body
+    finish = err.get("x_bridge_finish")
+    if err.get("fehler_code") != "modell_abbruch" or not isinstance(finish, dict):
+        return None
+    ablehnung: Dict[str, Any] = {"x_bridge_finish": finish}
+    for key in ("category", "provider_request_id"):
+        wert = err.get(key, finish.get(key))
+        if isinstance(wert, str) and wert:
+            ablehnung[key] = wert
+    iterationen = finish.get("iterations")
+    ganz = (isinstance(iterationen, list) and iterationen
+            and all(isinstance(it, dict)
+                    and all(isinstance(it.get(k), int) and not isinstance(it.get(k), bool)
+                            for k in ("input_tokens", "output_tokens"))
+                    for it in iterationen))
+    if not ganz:
+        return {"ablehnung": ablehnung, "usage_felder": {"usage_fehlt": "ablehnung_ohne_tokenangabe"}}
+
+    def _summe(key: str) -> int:
+        return sum(it[key] for it in iterationen
+                   if isinstance(it.get(key), int) and not isinstance(it.get(key), bool))
+    usage: Dict[str, Any] = {
+        "prompt_tokens": _summe("input_tokens"),
+        "completion_tokens": _summe("output_tokens"),
+        "cache_read_input_tokens": _summe("cache_read_input_tokens"),
+        "cache_creation_input_tokens": _summe("cache_creation_input_tokens"),
+        "cost_eur": None,
+        "cost_source": "unbekannt",
+        "quelle": "x_bridge_finish.iterations",
+    }
+    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    if isinstance(finish.get("cost_status"), str):
+        usage["cost_status"] = finish["cost_status"]
+    return {"ablehnung": ablehnung, "usage_felder": {"usage": usage}}
 
 
 def _upstream_status(code: Optional[str]) -> Optional[int]:

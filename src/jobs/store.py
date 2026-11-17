@@ -493,7 +493,12 @@ async def mark_error(
     for key in ("usage", "usage_fehlt"):
         if key in usage_felder:
             error[key] = usage_felder[key]
-    unbekannt = set(usage_felder) - {"usage", "usage_fehlt"}
+    # E3-1: what a refusal says about itself (error_contract.JOB_ERROR_ABLEHNUNG_KEYS).
+    from src.error_contract import JOB_ERROR_ABLEHNUNG_KEYS
+    for key in JOB_ERROR_ABLEHNUNG_KEYS:
+        if usage_felder.get(key) is not None:
+            error[key] = usage_felder[key]
+    unbekannt = set(usage_felder) - {"usage", "usage_fehlt", *JOB_ERROR_ABLEHNUNG_KEYS}
     if unbekannt:
         raise TypeError(f"mark_error: unknown fields {sorted(unbekannt)}")
     error.update(job_error_details(details))

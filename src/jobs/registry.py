@@ -34,6 +34,7 @@ from src.error_contract import (
     JOB_CODE_STORE_INCOMPATIBLE,
     job_code_fields,
     job_error_fields,
+    job_ablehnung_fields,
     job_usage_fields,
 )
 from src.jobs import store_client
@@ -393,7 +394,8 @@ async def _run_body(
         logger.error(f"❌ Async job {job_id} (kind={kind}) crashed: {e}", exc_info=True)
         try:
             await store_client.mark_error(
-                job_id, str(e), **job_error_fields(e), **job_usage_fields(e)
+                job_id, str(e), **job_error_fields(e), **job_usage_fields(e),
+                **job_ablehnung_fields(e),
             )
         except store_client.JobRowMissing:
             pass  # counted and logged by store_client

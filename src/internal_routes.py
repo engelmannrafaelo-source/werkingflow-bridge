@@ -775,6 +775,12 @@ class InternalJobError(BaseModel):
     # Absent for every other job; stored only when sent.
     usage: Optional[Dict[str, Any]] = None
     usage_fehlt: Optional[str] = None
+    # Refused chat self-call (E3-1): the refusal's own finish object, category
+    # and provider request id (error_contract.JOB_ERROR_ABLEHNUNG_KEYS). Absent
+    # for every other job. A platform-api from before E3-1 ignores them.
+    x_bridge_finish: Optional[Dict[str, Any]] = None
+    category: Optional[str] = None
+    provider_request_id: Optional[str] = None
     # Workers from before JOBENDE send none.
     details: Optional[InternalJobErrorDetails] = None
 
@@ -1042,7 +1048,8 @@ async def internal_mark_error(
         await store.mark_error(
             job_id, body.message, code=body.code,
             retryable=body.retryable, retry_after_s=body.retry_after_s,
-            **body.model_dump(include={"usage", "usage_fehlt"}, exclude_unset=True),
+            **body.model_dump(include={"usage", "usage_fehlt", "x_bridge_finish", "category",
+                                       "provider_request_id"}, exclude_unset=True),
             details=(body.details.model_dump(exclude_none=True)
                      if body.details else None),
         )
