@@ -381,6 +381,45 @@ class BoundPrincipal:
     user_email: Optional[str]
     tenant_id: str
     user_tenant_id: Optional[str]
+    # Kostendeckel (Migration 082). None = Zeile ohne Deckel -> der Verifier loest sie nicht auf.
+    cap_eur: Optional["Decimal"] = None
+    created_at: Optional[object] = None
+
+
+# Kostendeckel gebundener Principals (Kanzler-Entscheid (a), 17.11.2026): harter Stopp nach Erschoepfung,
+# kurze Lease-Laufzeit begrenzt das Ueberschiessen einer laufenden Session.
+BOUND_DECKEL_MAX_EUR = 100
+BOUND_LEASE_MAX_MIN = 15
+
+
+async def bound_spent_eur(bp: "BoundPrincipal") -> "Decimal":
+    """Verbrauch seit Anlage: usage_events (source sandbox) des gebundenen Nutzers fuer die gebundene App.
+    Kein Cache; DB-Fehler steigen auf (fail-loud -> 5xx, nie ein Lease ohne Pruefung)."""
+    from decimal import Decimal
+    import uuid as _uuid
+    async with get_pool().acquire() as conn:
+        v = await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(hypothetical_cost_eur), 0) FROM usage_events
+             WHERE source = 'sandbox' AND user_id = $1 AND app = $2 AND recorded_at >= $3
+            """,
+            _uuid.UUID(bp.user_id), bp.app_id, bp.created_at,
+        )
+    return Decimal(str(v))
+
+
+async def enforce_bound_cap(bp: "BoundPrincipal") -> None:
+    """402, wenn der Deckel erreicht ist; 403 ohne Deckel (darf nicht vorkommen: CHECK 082 + Lookup)."""
+    from fastapi import HTTPException
+    if bp.cap_eur is None or bp.created_at is None:
+        raise HTTPException(status_code=403, detail={"error": "bound_cap_missing"})
+    spent = await bound_spent_eur(bp)
+    if spent >= bp.cap_eur:
+        logger.warning("bound cap exhausted: principal=%s spent=%s cap=%s", bp.id, spent, bp.cap_eur)
+        raise HTTPException(status_code=402, detail={
+            "error": "budget_exhausted", "reason": "bound_cap_exhausted", "retryable": False,
+            "message": "Der Kostendeckel dieses gebundenen Zugangs ist aufgebraucht.",
+        })
 
 
 async def get_bound_principal_by_token(token: str) -> Optional[BoundPrincipal]:
@@ -395,7 +434,8 @@ async def get_bound_principal_by_token(token: str) -> Optional[BoundPrincipal]:
         row = await conn.fetchrow(
             """
             SELECT sp.id, sp.name, sp.allowed_apps, sp.proxy_routes, sp.proxy_user_id,
-                   sp.proxy_tenant_id, u.tenant_id AS user_tenant_id, u.email AS user_email
+                   sp.proxy_tenant_id, u.tenant_id AS user_tenant_id, u.email AS user_email,
+                   sp.proxy_cap_eur, sp.created_at
               FROM service_principals sp
               LEFT JOIN users u ON u.id = sp.proxy_user_id
              WHERE sp.token_hash = $1 AND sp.active
@@ -406,6 +446,8 @@ async def get_bound_principal_by_token(token: str) -> Optional[BoundPrincipal]:
         )
     if row is None or row["proxy_user_id"] is None or not row["proxy_tenant_id"]:
         return None
+    if row["proxy_cap_eur"] is None or row["proxy_cap_eur"] <= 0:
+        return None
     apps = list(row["allowed_apps"] or [])
     if len(apps) != 1 or apps[0] == WILDCARD:
         return None
@@ -414,6 +456,7 @@ async def get_bound_principal_by_token(token: str) -> Optional[BoundPrincipal]:
         routes=frozenset(row["proxy_routes"] or []) & BOUND_ROUTEN_OBERGRENZE,
         user_id=str(row["proxy_user_id"]), user_email=row["user_email"],
         tenant_id=row["proxy_tenant_id"], user_tenant_id=row["user_tenant_id"],
+        cap_eur=row["proxy_cap_eur"], created_at=row["created_at"],
     )
 
 
@@ -476,11 +519,15 @@ def is_wellformed_bound_token(token: str) -> bool:
 
 
 async def create_bound_principal(name: str, app_id: str, routes: List[str],
-                                 user_id: str, tenant_id: str, expires_at) -> dict:
+                                 user_id: str, tenant_id: str, expires_at, cap_eur) -> dict:
     """Legt einen gebundenen Principal an. Prueft in DERSELBEN Transaktion, dass
     der Nutzer existiert und serverseitig zu tenant_id gehoert (keine Slug-Annahme)."""
     import uuid as _uuid
     validate_bound_spec(routes, user_id, tenant_id, [app_id])
+    from decimal import Decimal
+    cap = Decimal(str(cap_eur))
+    if not (0 < cap <= BOUND_DECKEL_MAX_EUR):
+        raise ValueError(f"bound cap must be in (0, {BOUND_DECKEL_MAX_EUR}] EUR")
     # Der Token wird NUR hier erzeugt (32 Zufallsbytes); ein Aufrufer kann keinen
     # eigenen, womoeglich schwachen Wert einbringen. Rueckgabe einmalig im Ergebnis.
     token = new_bound_token()
@@ -494,16 +541,17 @@ async def create_bound_principal(name: str, app_id: str, routes: List[str],
                 """
                 INSERT INTO service_principals
                     (name, token_hash, token_prefix, allowed_apps, allowed_paths,
-                     proxy_routes, proxy_user_id, proxy_tenant_id, proxy_expires_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     proxy_routes, proxy_user_id, proxy_tenant_id, proxy_expires_at, proxy_cap_eur)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING id, name, allowed_apps, proxy_routes, proxy_user_id,
-                          proxy_tenant_id, proxy_expires_at
+                          proxy_tenant_id, proxy_expires_at, proxy_cap_eur
                 """,
                 name, hash_token(token), token[:8], [app_id], [BOUND_KEIN_KI_PFAD],
-                sorted(routes), uid, tenant_id, expires_at,
+                sorted(routes), uid, tenant_id, expires_at, cap,
             )
     invalidate_cache()
     return {"id": str(row["id"]), "name": row["name"], "allowed_apps": list(row["allowed_apps"]),
             "proxy_routes": list(row["proxy_routes"]), "proxy_user_id": str(row["proxy_user_id"]),
             "proxy_tenant_id": row["proxy_tenant_id"], "proxy_expires_at": row["proxy_expires_at"].isoformat(),
+            "proxy_cap_eur": str(row["proxy_cap_eur"]),
             "token": token}
