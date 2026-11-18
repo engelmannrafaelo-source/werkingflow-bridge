@@ -216,7 +216,10 @@ step() { :; }
 rssh() { echo "rssh $*" >> "$commands"; }
 HETZNER_COMPOSE=compose HETZNER_ALL="platform-api worker1"
 HETZNER_NEEDS_BUILD="platform-api" HETZNER_DB_CONTAINER=db HETZNER_SVC_platform_api=wt-platform-api
-SERVICES_ARG=() REMOTE_REPO=/repo HEALTH_TIMEOUT=1
+# HEALTH_TIMEOUT 30, not 1 (A-R2-1): with 1 s a second rollover between deadline and first check skipped the
+# health loop entirely -> 'Health timeout', no NACHHER, silent abort (1/11 under load). The rssh stub answers
+# 'healthy' at once, so nothing waits; the deploy itself uses 360 s.
+SERVICES_ARG=() REMOTE_REPO=/repo HEALTH_TIMEOUT=30
 phase_tooling_freshness_gate() { :; }
 phase_prod_order_gate() { :; }
 phase_preflight() { :; }
