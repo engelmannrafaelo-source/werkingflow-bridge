@@ -357,6 +357,8 @@ BOUND_ROUTEN_OBERGRENZE = frozenset({
     "POST /v1/sandbox/lease-token/{lease_id}/heartbeat",
     "POST /v1/sandbox/lease-token/{lease_id}/release",
     "POST /v1/sandbox/lease-token/{lease_id}/attach-session",
+    # Anthropic-Hauptpfad ueber die Bridge (Wire-Vertrag v2): OAuth bleibt serverseitig
+    "POST /v1/sandbox/lease-token/{lease_id}/anthropic/v1/messages",
     "POST /v1/sandbox/usage/record",
     "POST /v1/budget/check",
     "POST /v1/budget/deduct",
