@@ -24,7 +24,10 @@ from src.privacy_image.fehler import BildFehler
 SCHEMA_APP_ID = "werking-schema-generator"
 _DATA_URL = re.compile(r"data:(image/png|image/jpeg);base64,([A-Za-z0-9+/]+={0,2})")
 _TEXT_TYPEN = frozenset({"text"})
-_BILD_SPUREN = ("image", "data:", "file", "input_")
+#: Strukturelle Bildspuren im JSON (Schluessel/Typwerte; Nutzertext ist im Dump escaped und trifft sie nicht).
+_SPUR = re.compile(r'"(?:image_url|input_image|image_file|input_file|inline_data)"'
+                   r'|"type": "(?:image|file|document|input_image|input_file|image_file|image_url)"'
+                   r'|"(?:media_type|mime_type|mimetype|content_type)": "image/')
 
 
 @dataclass
@@ -49,6 +52,8 @@ def _bild_teil(teil: dict, rolle: Any) -> tuple:
         roh = base64.b64decode(b64, validate=True)
     except (binascii.Error, ValueError):
         raise BildFehler(422, "image_content_not_allowed")
+    if base64.b64encode(roh).decode("ascii") != b64:
+        raise BildFehler(422, "image_content_not_allowed")   # nur kanonisches Base64 (kein Ueberpadding, keine Restbits)
     passt = roh.startswith(b"\x89PNG\r\n\x1a\n") if mime == "image/png" else roh.startswith(b"\xff\xd8\xff")
     if not passt:
         raise BildFehler(422, "image_content_not_allowed")
@@ -84,6 +89,8 @@ def bild_aus_chat(body: Any) -> Optional[Bild]:
                 funde.append(_bild_teil(teil, n.get("role")))
                 continue
             raise BildFehler(422, "image_content_not_allowed")   # image, input_image, file, image_file, unbekannt
+    # Bild ausserhalb messages (andere Felder, metadata) -> 422; Inhalt von messages ist oben abschliessend geprueft.
+    keine_bildspur({k: v for k, v in body.items() if k != "messages"})
     meta = body.get("metadata")
     rid = meta.get("image_receipt_id") if isinstance(meta, dict) else None
     if len(funde) > 1:
@@ -103,6 +110,5 @@ def keine_bildspur(payload: Any) -> None:
     import json
 
     text = json.dumps(payload, default=str).lower()
-    if '"image_url"' in text or "data:image/" in text or '"input_image"' in text or '"image_file"' in text \
-            or '"type": "image"' in text or '"type": "file"' in text:
+    if "data:image/" in text or _SPUR.search(text):
         raise BildFehler(422, "image_content_not_allowed")
