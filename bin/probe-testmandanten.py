@@ -90,26 +90,56 @@ class Bridge:
             j = None
         return st, j
 
-    def alle(self, pfad):
-        """Volle Liste ueber Seiten; fail-closed, wenn die Obergrenze erreicht wird (dann ist 'nicht da' unbewiesen)."""
+    def durchgang(self, pfad):
+        """Ein voller Seitendurchgang (Vertrag am Commit: GET /v1/users kennt limit+offset, ORDER BY created_at DESC).
+        Ende ist belegt durch eine kurze Seite. Bei fester Zeilenzahl gilt: fehlt eine Zeile (gleiche created_at an
+        einer Seitengrenze, offset ignoriert), taucht eine andere doppelt auf → doppelte id = Bestand unbewiesen."""
         aus = []
         for s in range(SEITEN_MAX):
             trenn = "&" if "?" in pfad else "?"
             st, j = self.req("GET", f"{pfad}{trenn}limit={SEITE}&offset={s * SEITE}")
-            if st != 200 or not isinstance(j, list):
-                raise Abbruch(f"GET {pfad}: {st}")
+            if st != 200 or not isinstance(j, list) or len(j) > SEITE:
+                raise Abbruch(f"GET {pfad}: {st} — Bestand unbewiesen")
             aus.extend(j)
             if len(j) < SEITE:
+                ids = [str(u.get("id")) for u in aus]
+                if len(set(ids)) != len(ids):
+                    raise Abbruch(f"GET {pfad}: Seiten ueberlappen (doppelte id) — Bestand unbewiesen")
                 return aus
         raise Abbruch(f"GET {pfad}: mehr als {SEITE * SEITEN_MAX} Eintraege — Bestand unbewiesen")
 
-    def mandanten(self, art):
-        st, j = self.req("GET", f"/v1/tenants?account_type={art}&limit={SEITE}")
+    def alle(self, pfad):
+        """Volle Liste, zweimal gelesen; beide Durchgaenge muessen dieselbe Menge liefern (sonst aenderte sich der
+        Bestand waehrend des Lesens und eine Luecke ist nicht ausgeschlossen)."""
+        eins = self.durchgang(pfad)
+        zwei = self.durchgang(pfad)
+        if sorted(str(u.get("id")) for u in eins) != sorted(str(u.get("id")) for u in zwei):
+            raise Abbruch(f"GET {pfad}: Bestand aenderte sich zwischen zwei Durchgaengen — Bestand unbewiesen")
+        return eins
+
+    def mandant_existiert(self, tid):
+        """Exakter Lookup per ID. GET /v1/tenants kennt am Commit KEIN offset und kappt bei 1000 — als Existenzbeweis
+        untauglich. Vertrag am Commit: GET /v1/tenants/{id}/billing-address (Operator, reines SELECT ... WHERE id = $1):
+        200 = existiert; 404 NUR mit der exakten Bridge-Meldung = existiert nicht; alles andere (auch 404 'Not Found'
+        einer fehlenden Route, 401/403/5xx) = unbewiesen → Abbruch. Der Antwortinhalt wird nie ausgegeben."""
+        st, j = self.req("GET", f"/v1/tenants/{tid}/billing-address")
+        if st == 200 and isinstance(j, dict):
+            return True
+        if st == 404 and isinstance(j, dict) and j.get("detail") == f"Tenant '{tid}' not found":
+            return False
+        raise Abbruch(f"GET /v1/tenants/{tid}/billing-address: {st} — Existenz unbewiesen")
+
+    def typ_test(self, tid):
+        """Typbeweis account_type=test. Ohne Einzelroute nur ueber die Typliste: Anwesenheit mit account_type 'test'
+        beweist positiv, auch bei voller Liste. Abwesenheit beweist nur bei nicht voller Liste; sonst Abbruch."""
+        st, j = self.req("GET", f"/v1/tenants?account_type=test&limit={SEITE}")
         if st != 200 or not isinstance(j, list):
-            raise Abbruch(f"GET /v1/tenants?account_type={art}: {st}")
+            raise Abbruch(f"GET /v1/tenants?account_type=test: {st}")
+        if any(t.get("id") == tid and t.get("account_type") == "test" for t in j):
+            return True
         if len(j) >= SEITE:
-            raise Abbruch(f"GET /v1/tenants?account_type={art}: Obergrenze erreicht — Bestand unbewiesen")
-        return {t.get("id"): t for t in j}
+            raise Abbruch(f"GET /v1/tenants?account_type=test: Obergrenze erreicht, {tid} nicht darunter — Typ unbewiesen")
+        return False
 
 
 def paar(kennung):
@@ -148,9 +178,7 @@ def anlegen(b, a):
         raise SystemExit("ABBRUCH --beleg existiert schon — kein Ueberschreiben")
     # 1. Vorpruefung NUR lesend: weder Konto noch Mandant darf existieren.
     emails = {u.get("email", "").lower() for u in b.alle("/v1/users")}
-    vorhanden = set()
-    for art in ("test", "customer", "internal"):
-        vorhanden |= set(b.mandanten(art))
+    vorhanden = {p["tenant_id"] for p in ALLOWLIST if b.mandant_existiert(p["tenant_id"])}
     for p in ALLOWLIST:
         if p["email"] in emails or p["tenant_id"] in vorhanden:
             raise Abbruch(f"VORHANDEN {p['kennung']}: Konto oder Mandant existiert bereits — kein Write, kein PATCH")
@@ -214,7 +242,6 @@ def mitglieder(b, tid):
 
 def pruefe(b, beleg):
     rot = 0
-    test = b.mandanten("test")
     for e in beleg["paare"]:
         if e.get("tenant_angelegt") is not True:
             zeile(f"FAIL pruefen {e['kennung']}: Anlage des Mandanten nicht belegt"); rot += 1; continue
@@ -223,7 +250,7 @@ def pruefe(b, beleg):
         ok, j, st = nutzer_beweis(b, e)
         liz = (j or {}).get("app_licenses") or []
         lizenz_ok = len(liz) == 1 and liz[0].get("app_id") == APP_ID and liz[0].get("plan_id") == PLAN_ID and liz[0].get("seats") == 1
-        typ_ok = e["tenant_id"] in test
+        typ_ok = b.typ_test(e["tenant_id"])
         m = mitglieder(b, e["tenant_id"])
         alles = ok and lizenz_ok and typ_ok and m == [e["user_id"]]
         rot += not alles
@@ -236,9 +263,23 @@ def abbauen(b, a):
     beleg = lade_beleg(a.beleg, b.url)
     if os.path.exists(a.nachweis):
         raise SystemExit("ABBRUCH --nachweis existiert schon — kein Ueberschreiben")
-    test = b.mandanten("test")
+    # Alle Typbeweise VOR dem ersten DELETE (nur lesend): ein unbewiesener Typ bricht hier ohne Write ab.
+    typ = {e["tenant_id"]: b.typ_test(e["tenant_id"]) for e in beleg["paare"] if e.get("tenant_angelegt") is True}
     nachweis = {"bridge_url": b.url, "erstellt_am": jetzt(), "beleg_erstellt_am": beleg.get("erstellt_am"), "paare": []}
-    rot = 0
+    try:
+        abbau_paare(b, beleg, nachweis, typ)
+    except Abbruch as ex:
+        # Abbruch NACH einem DELETE (z. B. Readback unbewiesen): der Nachweis wird trotzdem geschrieben.
+        nachweis["abbruch"] = str(ex)
+        zeile(f"FAIL abbauen: {ex}")
+    rot = sum(1 for n in nachweis["paare"] if n.get("gut") is not True) + ("abbruch" in nachweis)
+    nachweis["rc"] = 0 if rot == 0 else 1
+    schreibe_neu(a.nachweis, nachweis)
+    zeile(f"INFO Abbau-Nachweis geschrieben (Schreibaufrufe={b.schreibe})")
+    return nachweis["rc"]
+
+
+def abbau_paare(b, beleg, nachweis, typ):
     for e in beleg["paare"]:
         n = {"kennung": e["kennung"], "tenant_id": e["tenant_id"], "user_id": e.get("user_id")}
         nachweis["paare"].append(n)
@@ -248,17 +289,17 @@ def abbauen(b, a):
         # nie loeschen, melden. Ohne belegte Mandantenanlage kann es auch keinen eigenen Nutzer geben.
         n["tenant_angelegt"] = e.get("tenant_angelegt") is True
         if not n["tenant_angelegt"]:
-            rot += 1
+            n["gut"] = False
             zeile(f"FAIL abbauen {e['kennung']}: Anlage des Mandanten nicht belegt — KEIN DELETE")
             continue
-        n["tenant_typ_test"] = tid in test
+        n["tenant_typ_test"] = typ[tid] is True
         m = mitglieder(b, tid)
         if e.get("user_id"):
             ok, _, st = nutzer_beweis(b, e)
             n["identitaet_ok"] = ok
             n["tenant_ein_mitglied"] = m == [e["user_id"]]
             if not (ok and n["tenant_typ_test"] and n["tenant_ein_mitglied"]):
-                rot += 1
+                n["gut"] = False
                 zeile(f"FAIL abbauen {e['kennung']}: Beweis fehlt (identitaet={ok} typ_test={n['tenant_typ_test']} "
                       f"einziges_mitglied={n['tenant_ein_mitglied']}) — KEIN DELETE")
                 continue
@@ -268,7 +309,7 @@ def abbauen(b, a):
                 # Fremdschluessel (z. B. Usage/Ledger nach einem echten Lauf mit Login/KI). Fail-closed: Mandant bleibt.
                 # Bereinigung ist ein EIGENER, benannter Schritt ausserhalb dieses Werkzeugs (Operator:
                 # POST /v1/users/{id}/anonymize bzw. Usage-Bereinigung), danach `abbauen` erneut mit demselben Beleg.
-                rot += 1
+                n["gut"] = False
                 n["bereinigung_noetig"] = True
                 zeile(f"FAIL abbauen {e['kennung']}: DELETE user 409 (Fremdschluessel) — Mandant bleibt; "
                       f"Bereinigung als eigener Schritt (anonymize/Usage), dann abbauen erneut")
@@ -280,26 +321,21 @@ def abbauen(b, a):
             n["identitaet_ok"] = None
             n["tenant_ein_mitglied"] = None
             if not (n["tenant_typ_test"] and m == []):
-                rot += 1
+                n["gut"] = False
                 zeile(f"FAIL abbauen {e['kennung']}: Mandant ohne Nutzer, aber typ_test={n['tenant_typ_test']} mitglieder={m} — KEIN DELETE")
                 continue
             n["readback_user_404"] = None
         # Die Bridge raeumt einen leeren, datenlosen Mandanten beim Nutzer-DELETE mit (drop_tenant_if_orphaned).
-        if tid in b.mandanten("test"):
+        if b.mandant_existiert(tid):
             st, _ = b.req("DELETE", f"/v1/tenants/{tid}")
             n["delete_tenant_status"] = st
         else:
             n["delete_tenant_status"] = "durch Nutzer-DELETE mitgeloescht"
-        weg = all(tid not in b.mandanten(art) for art in ("test", "customer", "internal"))
+        weg = not b.mandant_existiert(tid)
         n["readback_tenant_weg"] = weg
-        gut = weg and n.get("readback_user_404") is not False and n.get("delete_user_status", 204) == 204
-        rot += not gut
+        n["gut"] = gut = weg and n.get("readback_user_404") is not False and n.get("delete_user_status", 204) == 204
         zeile(f"{'PASS' if gut else 'FAIL'} abbauen {e['kennung']}: user_delete={n.get('delete_user_status')} "
               f"user_404={n['readback_user_404']} tenant={n['delete_tenant_status']} tenant_weg={weg}")
-    nachweis["rc"] = 0 if rot == 0 else 1
-    schreibe_neu(a.nachweis, nachweis)
-    zeile(f"INFO Abbau-Nachweis geschrieben (Schreibaufrufe={b.schreibe})")
-    return nachweis["rc"]
 
 
 def main(argv=None):
