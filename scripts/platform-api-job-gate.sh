@@ -54,22 +54,28 @@ JOBGATE_VOR_RECREATE_RC=5
 
 # mit_frist <s> <command...> — runs a command or shell FUNCTION with a local
 # deadline (coreutils `timeout` cannot run functions). stdin is passed on.
-# Returns the command's rc, or 124 when the deadline hit.
+# Returns the command's rc, or 124 whenever the deadline hit (also when the
+# command happened to end at the same moment: fail-closed).
+# The watchdog ends the subshell AND its direct children in ONE kill: ending
+# only the children first let a function resume and return 0 (race, found by
+# the shell test). Timeout is detected by a marker, not by the rc.
 mit_frist() {
     local frist="$1"; shift
+    local marke
+    marke=$(mktemp -d) || return 124
     ( "$@" ) 0<&0 &
     local pid=$!
     # The watchdog must not hold the caller's stdout (a $(...) would wait for it).
-    ( command sleep "$frist"; pkill -TERM -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+    ( command sleep "$frist"; : > "$marke/abgelaufen"; kill -TERM "$pid" $(pgrep -P "$pid") 2>/dev/null ) </dev/null >/dev/null 2>&1 &
     local wache=$!
     local rc=0
     wait "$pid" || rc=$?
-    if kill -0 "$wache" 2>/dev/null; then
-        pkill -TERM -P "$wache" 2>/dev/null; kill -TERM "$wache" 2>/dev/null; wait "$wache" 2>/dev/null
-        return "$rc"
-    fi
-    wait "$wache" 2>/dev/null
-    return 124
+    # Same rule for the watchdog: end it together with its sleep, or a freed
+    # watchdog would still write the marker.
+    kill -TERM "$wache" $(pgrep -P "$wache") 2>/dev/null; wait "$wache" 2>/dev/null
+    [[ -e "$marke/abgelaufen" ]] && rc=124
+    rm -f "$marke/abgelaufen"; rmdir "$marke" 2>/dev/null
+    return "$rc"
 }
 
 # Services whose recreation leaves the platform-api without an answer: the
