@@ -46,6 +46,31 @@ PLATFORM_API_JOBGATE_POLL_S="${PLATFORM_API_JOBGATE_POLL_S:-10}"
 # Fixed on purpose (not overridable from the environment): the exact host the prod store is asked from.
 readonly PLATFORM_API_JOBGATE_REMOTE_HOSTNAME="prod-workers-1"
 PLATFORM_API_JOBGATE_REMOTE_TIMEOUT_S=60
+# A-GP-3 (Review P1): LOCAL deadline around every remote call of the remote
+# probe (hostname, inspect, exec). A hanging SSH session ends as rc 124 = error.
+PLATFORM_API_JOBGATE_SSH_FRIST_S="${PLATFORM_API_JOBGATE_SSH_FRIST_S:-90}"
+# rc of deploy_one_service when the second gate round refuses (A-GP-1).
+JOBGATE_VOR_RECREATE_RC=5
+
+# mit_frist <s> <command...> — runs a command or shell FUNCTION with a local
+# deadline (coreutils `timeout` cannot run functions). stdin is passed on.
+# Returns the command's rc, or 124 when the deadline hit.
+mit_frist() {
+    local frist="$1"; shift
+    ( "$@" ) 0<&0 &
+    local pid=$!
+    # The watchdog must not hold the caller's stdout (a $(...) would wait for it).
+    ( command sleep "$frist"; pkill -TERM -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+    local wache=$!
+    local rc=0
+    wait "$pid" || rc=$?
+    if kill -0 "$wache" 2>/dev/null; then
+        pkill -TERM -P "$wache" 2>/dev/null; kill -TERM "$wache" 2>/dev/null; wait "$wache" 2>/dev/null
+        return "$rc"
+    fi
+    wait "$wache" 2>/dev/null
+    return 124
+}
 
 # Services whose recreation leaves the platform-api without an answer: the
 # platform-api itself and, where it runs next to it, its database.
@@ -117,17 +142,17 @@ platform_api_job_gate_probe() {
 platform_api_job_gate_remote_probe() {
     local eigen="$1" heimat="$2" host="$3"; shift 3
     local seen_host container state rc
-    seen_host=$(rssh "$host" "hostname" 2>/dev/null) || { echo "remote ${eigen}: ssh to ${host} failed"; return 2; }
+    seen_host=$(mit_frist "$PLATFORM_API_JOBGATE_SSH_FRIST_S" rssh "$host" "hostname" 2>/dev/null) || { echo "remote ${eigen}: ssh to ${host} failed or timed out"; return 2; }
     if [[ "$seen_host" != "$PLATFORM_API_JOBGATE_REMOTE_HOSTNAME" ]]; then
         echo "remote ${eigen}: host ${host} is '${seen_host}', expected '${PLATFORM_API_JOBGATE_REMOTE_HOSTNAME}'"
         return 2
     fi
     for container in "$@"; do
         [[ "$container" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "remote ${eigen}: bad container name"; return 2; }
-        state=$(rssh "$host" "docker inspect --format '{{.Name}} {{.State.Running}}' '${container}' 2>/dev/null" 2>/dev/null) || continue
+        state=$(mit_frist "$PLATFORM_API_JOBGATE_SSH_FRIST_S" rssh "$host" "docker inspect --format '{{.Name}} {{.State.Running}}' '${container}' 2>/dev/null" 2>/dev/null) || continue
         [[ "$state" == "/${container} true" ]] || continue
         rc=0
-        rssh "$host" "timeout ${PLATFORM_API_JOBGATE_REMOTE_TIMEOUT_S} docker exec -i '${container}' python3 - --eigen '${eigen}' --heimat '${heimat}'" \
+        mit_frist "$PLATFORM_API_JOBGATE_SSH_FRIST_S" rssh "$host" "timeout ${PLATFORM_API_JOBGATE_REMOTE_TIMEOUT_S} docker exec -i '${container}' python3 - --eigen '${eigen}' --heimat '${heimat}'" \
             < "$(dirname "${BASH_SOURCE[0]}")/platform_api_job_gate_heimat.py" || rc=$?
         case "$rc" in
             0|1) return "$rc" ;;

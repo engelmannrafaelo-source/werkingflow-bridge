@@ -98,6 +98,24 @@ echo 'PASS P1 remote: ssh failure is an error'
 rc=0; platform_api_job_gate_remote_probe prod dev wh "ku;rm" > /dev/null || rc=$?; [[ $rc == 2 ]]
 echo 'PASS P1 remote: malformed container name is refused before ssh'
 
+# --- A-GP-3: local deadline around every remote call ---
+rc=0; mit_frist 1 command sleep 5 || rc=$?; [[ $rc == 124 ]]
+rc=0; mit_frist 5 bash -c 'exit 3' || rc=$?; [[ $rc == 3 ]]
+[[ $(printf 'durch\n' | mit_frist 5 cat) == durch ]]
+echo 'PASS A-GP-3: mit_frist ends a hanging call with 124, keeps rc and stdin otherwise'
+haenge=""
+rssh_alt=$(declare -f rssh)
+rssh() { echo "rssh $*" >> "$commands"; [[ "$*" == *"$haenge"* && -n "$haenge" ]] && command sleep 30; [[ "$2" == hostname ]] && { echo prod-workers-1; return 0; }
+         [[ "$*" == *'{{.Name}}'* ]] && { echo "/ku true"; return 0; }; [[ "$*" == *'docker exec -i'* ]] && { cat > /dev/null; return 0; }; }
+PLATFORM_API_JOBGATE_SSH_FRIST_S=1
+for h in hostname "docker inspect" "docker exec"; do
+    haenge="$h"; t0=$SECONDS; [[ $(rp) == 2 ]] || { echo "FAIL hang in $h not an error"; exit 1; }; (( SECONDS - t0 < 10 )) || { echo "FAIL hang in $h not bounded"; exit 1; }
+done
+haenge=""; [[ $(rp) == 0 ]]
+PLATFORM_API_JOBGATE_SSH_FRIST_S=90
+eval "$rssh_alt"
+echo 'PASS A-GP-3: a hanging hostname/inspect/exec is bounded locally and refused'
+
 # --- P1: combined round (local probe + remote probe) ---
 platform_api_job_gate_probe() { echo "PROBE $*" >> "$commands"; return "$local_rc"; }
 platform_api_job_gate_remote_probe() { echo "REMOTE $*" >> "$commands"; return "$remote_rc"; }
@@ -276,3 +294,56 @@ deploy_server server2 > /dev/null 2>&1 || true
 absent '^GATE'
 SERVICES_ARG=()
 echo 'PASS server2: postgres-prod alone is gated, nginx alone is not'
+
+# --- A-GP-1: second gate round right before the platform-api recreation (hetzner) ---
+gate_runden=$(mktemp)
+HETZNER_SVC_nginx=nginx HETZNER_SVC_worker1=w1
+SERVICES_ARG=(platform-api)   # Worker liefen sonst in die 900-s-ready_for_shutdown-Schleife (sleep gemockt)
+measure_pool_before_deploy() { :; }
+lb_nach_workerwechsel() { echo "LB $*" >> "$commands"; return 0; }
+platform_api_job_gate() { echo "GATE $*" >> "$commands"; local n; n=$(head -n1 "$gate_runden"); sed -i 1d "$gate_runden"; return "${n:-3}"; }
+printf '0\n3\n' > "$gate_runden"
+: > "$commands"
+rc=0; deploy_server hetzner > /dev/null 2>&1 || rc=$?
+[[ $rc != 0 ]]
+[[ $(grep -c '^GATE HETZNER$' "$commands") == 2 ]]
+grep -q 'build --no-cache platform-api' "$commands"
+absent 'up -d --no-deps --force-recreate platform-api'
+absent '^ROLLBACK'
+grep -q "git reset --hard 'synthetic-sha'" "$commands"
+first_build=$(grep -n 'build --no-cache platform-api' "$commands" | head -n1 | cut -d: -f1)
+second_gate=$(grep -n '^GATE HETZNER$' "$commands" | sed -n 2p | cut -d: -f1)
+(( second_gate > first_build ))
+echo 'PASS A-GP-1: second round after the build refuses -> no recreation, no rollback recreation, code reset'
+printf '0\n0\n' > "$gate_runden"
+: > "$commands"
+deploy_server hetzner > /dev/null 2>&1 || true
+[[ $(grep -c '^GATE HETZNER$' "$commands") == 2 ]]
+second_gate=$(grep -n '^GATE HETZNER$' "$commands" | sed -n 2p | cut -d: -f1)
+pa_up=$(grep -n 'up -d --no-deps --force-recreate platform-api' "$commands" | head -n1 | cut -d: -f1)
+[[ -n "$pa_up" ]] && (( second_gate < pa_up ))
+echo 'PASS A-GP-1: second round idle -> recreation follows directly after it'
+SERVICES_ARG=()
+printf '0\n' > "$gate_runden"
+: > "$commands"
+deploy_server server2 > /dev/null 2>&1 || true
+[[ $(grep -c '^GATE SERVER2$' "$commands") == 1 ]]
+echo 'PASS A-GP-1: server2 keeps one round (postgres-prod first, BR8R M1)'
+rm -f "$gate_runden"
+
+# --- A-GP-2: read-only after-record also after a rollback that recreates platform-api ---
+python3 - "$functions" <<'PY2'
+import re, sys
+from pathlib import Path
+src = Path('scripts/bridge-deploy.sh').read_text()
+Path(sys.argv[1]).write_text(re.search(r'^phase_rollback\(\) *\{.*?^\}', src, re.M | re.S)[0])
+PY2
+source "$functions"
+_phase_rollback_kern() { echo "KERN $*" >> "$commands"; return "${kern_rc:-0}"; }
+platform_api_job_gate_nachher() { echo "NACHHER $*" >> "$commands"; }
+JOBGATE_NACHHER_PREFIX=HETZNER DRY_RUN=false
+: > "$commands"; kern_rc=0; phase_rollback hz compose sha bl platform-api worker1; grep -q '^NACHHER HETZNER$' "$commands"
+: > "$commands"; kern_rc=2; rc=0; phase_rollback hz compose sha bl worker1 platform-api || rc=$?; [[ $rc == 2 ]]; grep -q '^NACHHER HETZNER$' "$commands"
+: > "$commands"; kern_rc=0; phase_rollback hz compose sha bl worker1 worker2; absent '^NACHHER'
+JOBGATE_NACHHER_PREFIX=""; : > "$commands"; phase_rollback hz compose sha bl platform-api; absent '^NACHHER'
+echo 'PASS A-GP-2: after-record after every rollback with platform-api (also a failed one, rc kept), never otherwise'
