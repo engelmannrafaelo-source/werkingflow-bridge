@@ -50,7 +50,7 @@ def _operator_claims() -> AuthClaims:
     """Service-token without X-User-ID → operator (is_operator=True)."""
     return AuthClaims(
         kind="service", user_id=None, email=None, tenant_id=None,
-        is_admin=True, acting_user_id=None,
+        is_admin=True, acting_user_id=None, global_token_verified=True,
     )
 
 

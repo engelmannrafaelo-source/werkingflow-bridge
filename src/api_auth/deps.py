@@ -81,20 +81,16 @@ class AuthClaims:
         """
         True when this credential grants unrestricted cross-user access.
 
-        Two cases:
-          1. Service token without a proxied user (acting_user_id is None).
-             The classic operator: CUI platform panel, background jobs, etc.
-          2. User JWT with is_admin=True. Currently is_admin is never set in
-             JWTs (known bug tracked separately), but is handled here for
-             correctness when that changes.
+        Only ONE case (SEC-Entscheid H-BT-4, 17.11.2026): the verified global
+        service token without a proxied user (acting_user_id is None) — the
+        classic operator (CUI platform panel, background jobs).
 
-        A service token WITH X-User-ID is NOT an operator: it is scoped to
-        that specific user for all self-service endpoints.
+        A JWT is NEVER an operator, not even with isAdmin=true: under the shared
+        HS256 secret every secret holder could mint one. A future platform-admin
+        JWT needs a separate trusted asymmetric issuer. A service token WITH
+        X-User-ID is not an operator either: it is scoped to that user.
         """
-        if self.is_service:
-            return self.acting_user_id is None
-        # User JWT: operator only when explicitly flagged as admin.
-        return self.is_admin
+        return self.is_global_operator
 
     @property
     def is_global_operator(self) -> bool:
@@ -145,7 +141,9 @@ def _decode_user_jwt(token: str) -> AuthClaims:
         user_id=uid,
         email=payload.get("email"),
         tenant_id=payload.get("tenantId"),
-        is_admin=bool(payload.get("isAdmin", False)),
+        # Informational only, never an authorization basis (is_operator ignores it);
+        # literal JSON true only — no string truthiness ("false" was True before).
+        is_admin=payload.get("isAdmin") is True,
         acting_user_id=uid,  # JWT sub is always the acting identity for user JWTs
         role=payload.get("role"),
     )

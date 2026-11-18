@@ -21,7 +21,7 @@ def _operator() -> AuthClaims:
     """Service token without X-User-ID — unrestricted operator."""
     return AuthClaims(
         kind="service", user_id=None, email=None, tenant_id=None,
-        is_admin=True, acting_user_id=None,
+        is_admin=True, acting_user_id=None, global_token_verified=True,
     )
 
 
@@ -29,7 +29,7 @@ def _proxy(user_id: str) -> AuthClaims:
     """Service token WITH X-User-ID — proxy acting for the given user."""
     return AuthClaims(
         kind="service", user_id=None, email=None, tenant_id=None,
-        is_admin=True, acting_user_id=user_id,
+        is_admin=True, acting_user_id=user_id, global_token_verified=True,
     )
 
 
@@ -67,8 +67,9 @@ class TestIsOperator:
     def test_regular_user_not_operator(self):
         assert _user("user-A").is_operator is False
 
-    def test_admin_jwt_is_operator(self):
-        assert _admin_jwt().is_operator is True
+    def test_admin_jwt_is_not_operator(self):
+        # SEC H-BT-4 (17.11.2026): a JWT is never an operator, not even with isAdmin.
+        assert _admin_jwt().is_operator is False
 
 
 # ---------------------------------------------------------------------------
@@ -122,10 +123,12 @@ class TestRequireSelfOrAdmin:
             require_self_or_admin("user-B", _user("user-A"))
         assert exc.value.status_code == 403
 
-    # Admin JWT: unrestricted
-    def test_admin_jwt_can_access_any_user(self):
-        require_self_or_admin("user-A", _admin_jwt())
-        require_self_or_admin("user-B", _admin_jwt())
+    # Admin JWT (SEC H-BT-4): only its own user, never others
+    def test_admin_jwt_cannot_access_other_user(self):
+        require_self_or_admin("user-A", _admin_jwt("user-A"))
+        with pytest.raises(HTTPException) as exc:
+            require_self_or_admin("user-B", _admin_jwt("user-A"))
+        assert exc.value.status_code == 403
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +167,11 @@ class TestRequireAdmin:
     def test_operator_allowed(self):
         assert require_admin(_operator()).is_operator is True
 
-    def test_admin_jwt_allowed(self):
-        assert require_admin(_admin_jwt()).is_operator is True
+    def test_admin_jwt_rejected(self):
+        # SEC H-BT-4: isAdmin in a shared-secret JWT grants no operator rights.
+        with pytest.raises(HTTPException) as exc:
+            require_admin(_admin_jwt())
+        assert exc.value.status_code == 403
 
     def test_proxy_token_rejected(self):
         """A customer proxy is is_admin=True but must NOT reach operator endpoints."""
