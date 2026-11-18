@@ -553,6 +553,30 @@ async def create_job_endpoint(
         attribution[ZEITKONTEXT_KEY] = _zeitkontext
     attribution = attribution or None
 
+    # Bild-PII-Maske (A-W3-1, Schnittstelle Bild v3 §3): fuer die Schema-App jede Bildform per Allowlist pruefen;
+    # Bild nur in kind=chat, nur mit Idempotency-Key und nur ueber einen nicht-legacy Principal. Bytes/sha/MIME
+    # gehen an den Store und werden dort VOR dem Verbrauch gegen den Receipt geprueft (eine Transaktion).
+    _bild = None
+    if (attribution or {}).get("app_id") == _SCHEMA_APP_ID or _schema_auth_app == _SCHEMA_APP_ID:
+        from src.privacy_image import pruefung as _bp
+        from src.privacy_image.fehler import BildFehler as _BildFehler
+        try:
+            if body.kind == "chat":
+                _b = _bp.bild_aus_chat(body.payload or {})
+                if _b is not None:
+                    if idem_key is None:
+                        raise _BildFehler(422, "image_requires_idempotency_key")
+                    if _principal is None or getattr(_principal, "is_legacy", False):
+                        raise _BildFehler(403, "image_mask_principal_not_allowed")
+                    _bild = {"receipt_id": _b.receipt_id, "sha256": _b.sha256, "mime": _b.mime,
+                             "principal": _principal.name, "tenant": str((attribution or {}).get("tenant_id") or "")}
+                    if not _bild["tenant"]:
+                        raise _BildFehler(403, "image_receipt_principal_mismatch")
+            else:
+                _bp.keine_bildspur(body.payload)
+        except _BildFehler as _f:
+            return JSONResponse(status_code=_f.status, content=_f.body())
+
     # Placement veto (Autobahn): the job EXECUTES on THIS worker (spawn below),
     # and the executor's chat self-call pins to localhost — the LLM work can
     # only ever use THIS worker's account. If that account is capacity-locked
@@ -668,7 +692,7 @@ async def create_job_endpoint(
         return job_home_unconfigured_error(str(e))
 
     if idem_key is not None:
-        return await _create_keyed_job(job_id, body, attribution, idem_key, idem_owner)
+        return await _create_keyed_job(job_id, body, attribution, idem_key, idem_owner, bild=_bild)
 
     # Persist FIRST (durable 'pending'), then dispatch. If this worker dies before
     # the task runs, the row survives at 'pending' and the watchdog requeues it
@@ -686,14 +710,20 @@ async def _create_keyed_job(
     attribution: Optional[Dict[str, Any]],
     key: str,
     owner: str,
+    bild: Optional[Dict[str, Any]] = None,
 ) -> JSONResponse:
     """Persist-then-dispatch like the unkeyed path, but through the store's
     atomic create-once (BRREF2). Only the request that created the row
-    dispatches it; a replay returns the existing job and starts nothing."""
+    dispatches it; a replay returns the existing job and starts nothing.
+    ``bild``: Receipt-Verbrauch in derselben Transaktion (Bild-PII-Maske)."""
+    from src.privacy_image.fehler import BildFehler as _BildFehler
     try:
         outcome = await store_client.create_job_idempotent(
-            job_id, body.kind, body.payload, attribution, owner, key
+            job_id, body.kind, body.payload, attribution, owner, key,
+            **({"bild": bild} if bild is not None else {})
         )
+    except _BildFehler as _f:
+        return JSONResponse(status_code=_f.status, content=_f.body())
     except store_client.IdempotencyKeyReused as e:
         return _key_reused(key, owner, e.job_id)
     except store_client.IdempotencyUnsupported as e:

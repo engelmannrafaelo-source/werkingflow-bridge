@@ -277,8 +277,10 @@ async def create_job_idempotent(
     attribution: Optional[Dict[str, Any]],
     owner: str,
     key: str,
+    bild: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """store.create_job_idempotent over the platform seam (BRREF2).
+    ``bild``: Receipt-Verbrauch in derselben Transaktion (Bild-PII-Maske); Abweichung -> BildFehler (auch im Rueckfall).
 
     Safe to fall back after a timeout, unlike mark_running: if the platform
     call did insert the row and only the answer got lost, the direct-DB call
@@ -294,15 +296,20 @@ async def create_job_idempotent(
                 "job_id": job_id, "kind": kind, "payload": payload,
                 "attribution": attribution,
                 "idempotency_owner": owner, "idempotency_key": key,
+                **({"bild": bild} if bild is not None else {}),
             },
             timeout_s=_WRITE_TIMEOUT_S,
         )
     except PlatformUnavailable as e:
         _fallback_or_raise("create_job_idempotent", e)
         return await store.create_job_idempotent(
-            job_id, kind, payload, attribution, owner, key
+            job_id, kind, payload, attribution, owner, key, **({"bild": bild} if bild is not None else {})
         )
     body = resp.json if isinstance(resp.json, dict) else {}
+    _d = body.get("detail")
+    if isinstance(_d, dict) and _d.get("reason") == "bild":
+        from src.privacy_image.fehler import BildFehler
+        raise BildFehler(resp.status_code, str(_d.get("code")))
     created_shape = isinstance(body.get("job"), dict) and "created" in body
     if resp.status_code == 200 and created_shape:
         return {"created": bool(body["created"]), "job": body["job"]}
