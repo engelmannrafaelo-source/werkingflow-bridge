@@ -101,7 +101,7 @@ def maske_anfrage(teile: Iterable[Tuple[str, bytes]]) -> MaskenAnfrage:
         gesehen[name] = wert
     modus = gesehen.get("modus", b"").decode("utf-8", "replace").strip()
     if modus not in ("vorschlag", "final"):
-        raise BildFehler(400, "image_mode_invalid")
+        raise BildFehler(422, "image_mode_invalid")
     bild = gesehen.get("bild")
     if not bild:
         raise BildFehler(422, "image_unreadable")
@@ -165,3 +165,35 @@ def receipt_anfrage(obj) -> ReceiptAnfrage:
     if not isinstance(sha, str) or not _HEX64.fullmatch(sha) or mime not in ("image/png", "image/jpeg"):
         raise BildFehler(403, "image_receipt_sha_mismatch")
     return ReceiptAnfrage(tok, sha, mime, True, b["leer_zweitbestaetigung"], b["zeit"])
+
+
+MAX_KOERPER_BYTES = MAX_BILD_BYTES + 2 * MAX_HANDMASKEN_BYTES + 65536
+
+
+def multipart_teile(content_type: str, koerper: bytes) -> List[Tuple[str, bytes]]:
+    """Multipart/form-data rein im Speicher zerlegen (stdlib email-Parser; KEIN Spool auf Platte wie bei
+    Starlette-UploadFile ab 1 MiB, A-BV-2). Liefert (Name, Bytes) je Teil in Eingangsreihenfolge."""
+    from email.parser import BytesParser
+    from email.policy import HTTP
+
+    if len(koerper) > MAX_KOERPER_BYTES:
+        raise BildFehler(413, "image_too_large")
+    ct = (content_type or "").strip()
+    if not ct.lower().startswith("multipart/form-data") or "boundary=" not in ct.lower():
+        raise BildFehler(422, "image_field_unknown")
+    try:
+        msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ct.encode("latin-1") + b"\r\n\r\n" + koerper)
+    except Exception:
+        raise BildFehler(422, "image_field_unknown")
+    if not msg.is_multipart():
+        raise BildFehler(422, "image_field_unknown")
+    teile: List[Tuple[str, bytes]] = []
+    for teil in msg.iter_parts():
+        if teil.get_content_disposition() != "form-data":
+            raise BildFehler(422, "image_field_unknown")
+        name = teil.get_param("name", header="content-disposition")
+        if not isinstance(name, str) or not name:
+            raise BildFehler(422, "image_field_unknown")
+        nutz = teil.get_payload(decode=True)
+        teile.append((name, nutz if isinstance(nutz, bytes) else b""))
+    return teile
