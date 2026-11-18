@@ -71,6 +71,7 @@ LOOPBACK = re.compile(r"^http://127\.0\.0\.1:[0-9]{1,5}$")
 PRINCIPAL_CACHE_S, PIN_CACHE_S = 25, 65   # P-2: Principal-Cache 20 s, Pin-Cache 60 s, je + 5 s
 SEITE, SEITEN_MAX = 1000, 20
 TIMEOUT = 30
+ABLAGE_TIMEOUT = 60
 NONEU_CODES = ("schema_noneu_test_user_not_allowed", "schema_noneu_test_principal_not_allowed")
 # Fuer SECs Spurenleser (nur lesend, $1 = Test-UUID). Tabellen am Commit: usage_events (Bridge-Ledger, 016),
 # ai_jobs (attribution JSONB), budget_reservations (080). "usage" = Jobs des Test-Users.
@@ -251,7 +252,10 @@ class Ablage:
 
     def lies(self, name):
         """(vorhanden, wert). Wert bleibt im Prozess."""
-        r = subprocess.run(self._fuell(self.leser, name), capture_output=True, text=True, timeout=60)
+        try:
+            r = subprocess.run(self._fuell(self.leser, name), capture_output=True, text=True, timeout=ABLAGE_TIMEOUT)
+        except (subprocess.SubprocessError, OSError) as e:
+            raise Abbruch(f"Leser {name}: {type(e).__name__}")
         if r.returncode == 4:
             return False, None
         if r.returncode != 0:
@@ -259,7 +263,11 @@ class Ablage:
         return True, r.stdout.rstrip("\n")
 
     def schreib(self, name, wert):
-        r = subprocess.run(self._fuell(self.schreiber, name), input=wert, capture_output=True, text=True, timeout=60)
+        try:
+            r = subprocess.run(self._fuell(self.schreiber, name), input=wert, capture_output=True, text=True,
+                               timeout=ABLAGE_TIMEOUT)
+        except (subprocess.SubprocessError, OSError) as e:
+            raise Abbruch(f"Schreiber {name}: {type(e).__name__}")
         if wert in (r.stdout + r.stderr):
             raise Abbruch(f"Schreiber {name}: Ausgabe enthielt den Wert — abgebrochen")
         if r.returncode != 0:
@@ -337,17 +345,36 @@ def anlegen(b, abl, a):
         raise
     except Abbruch as e:
         zeile(f"FAIL anlegen: {e}")
-        rc = 1
-        if beleg.get("principal_angelegt"):
-            b.deaktivieren("Abbruch nach Principal-Anlage")
-            rc = 6
+        rc = nach_principal_fehler(b, beleg)
+    except Exception as e:  # W-1 (R1): auch unerwartete Fehler nach dem POST duerfen keinen aktiven Principal hinterlassen
+        zeile(f"FAIL anlegen: unerwartet {type(e).__name__}")
+        rc = nach_principal_fehler(b, beleg)
     finally:
         schreibe_neu(a.beleg, beleg)
         zeile(f"INFO Anlagebeleg geschrieben (Schreibaufrufe={b.schreibe})")
     return rc or pruefe(b, abl, beleg)
 
 
+def nach_principal_fehler(b, beleg):
+    """W-2 (R1): Wurde der Principal-POST versucht, entscheidet die Bridge-Liste, nicht die Antwort (Verbindungsfehler
+    nach serverseitiger Anlage). Vorhanden → deaktivieren, rc 6; Liste unlesbar → rc 7 (unbelegt)."""
+    if not beleg.get("principal_post_versucht"):
+        return 1
+    try:
+        vorhanden = bool(b.principals())
+    except Exception as e:
+        zeile(f"FEHLER Principal-Liste nach Fehler unlesbar ({type(e).__name__}) — Zustand unbelegt, SOFORT an SEC/Kanzler")
+        return 7
+    if not vorhanden:
+        return 1
+    beleg["principal_angelegt"] = True
+    b.deaktivieren("Fehler nach Principal-POST")
+    zeile("INFO evtl. teilweise geschriebene Infisical-Namen entfernt SEC (H-2, nicht im Werkzeug)")
+    return 6
+
+
 def principal_anlegen(b, abl, beleg, uid):
+    beleg["principal_post_versucht"] = True
     st, p, _ = b.req("POST", "/v1/admin/service-principals",
                      {"name": NAME, "allowed_apps": [APP], "allowed_paths": list(ALLOWED_PATHS)})
     key = p.pop("token", None) if isinstance(p, dict) else None
@@ -496,7 +523,8 @@ def abbauen(b, abl, a, beleg, worker):
         n["abbruch"] = str(e)
         zeile(f"FAIL abbauen: {e}")
     finally:
-        gut = (n.get("principal_aus") is True and n.get("alter_schluessel_401_alle") is True and "abbruch" not in n
+        gut = (n.get("principal_aus") in (True, "nicht_vorhanden")
+               and n.get("alter_schluessel_401_alle") in (True, "kein_schluessel_abgelegt", "nicht_vorhanden") and "abbruch" not in n
                and n.get("pin_geloest") is True and n.get("abo_gekuendigt") is True
                and n.get("user") in ("geloescht", "anonymisiert"))
         n["rc"] = 0 if gut else 1
@@ -509,16 +537,21 @@ def abbau_schritte(b, abl, a, beleg, worker, n):
     uid = beleg.get("user_id")
     # 1. Principal zuerst (Sofort-Rueckweg: zu nach <= 20 s). Ein vorhandener Principal mit diesem Namen ist
     #    Allowlist-Objekt; ohne Anlagebeleg wird er trotzdem nur deaktiviert (nie geloescht, keine Route).
-    if beleg.get("principal_angelegt") and b.principals():
+    #    W-2 (R1): unabhaengig von principal_angelegt im Beleg (Anlage evtl. ohne Antwort).
+    if b.principals():
         b.deaktivieren("abbauen")
         n["principal_aus"] = True
-        st = alter_schluessel_tot(b, abl, a, beleg, worker)
-        n["alter_schluessel_status"] = st
-        n["alter_schluessel_401_alle"] = bool(st) and len(st) == len(worker) and all(v == 401 for v in st.values())
-        zeile(f"{'PASS' if n['alter_schluessel_401_alle'] else 'FAIL'} alter Schluessel nach {a.cache_wartezeit} s: {st}")
+        if (beleg.get("schluessel") or {}).get("fp8"):
+            st = alter_schluessel_tot(b, abl, a, beleg, worker)
+            n["alter_schluessel_status"] = st
+            n["alter_schluessel_401_alle"] = bool(st) and len(st) == len(worker) and all(v == 401 for v in st.values())
+            zeile(f"{'PASS' if n['alter_schluessel_401_alle'] else 'FAIL'} alter Schluessel nach {a.cache_wartezeit} s: {st}")
+        else:
+            n["alter_schluessel_401_alle"] = "kein_schluessel_abgelegt"
+            zeile("INFO Principal deaktiviert; Schluessel nie abgelegt (niemandem bekannt), kein 401-Readback moeglich")
     else:
-        n["principal_aus"] = n["alter_schluessel_401_alle"] = None
-        zeile("INFO kein Principal aus diesem Beleg vorhanden")
+        n["principal_aus"] = n["alter_schluessel_401_alle"] = "nicht_vorhanden"
+        zeile("INFO kein Principal mit dem Allowlist-Namen vorhanden")
     if not beleg.get("tenant_angelegt") or not uid:
         raise Abbruch("Anlage von Tenant/User nicht belegt — kein weiterer Write")
     ok_id, _ = identitaet(b, beleg)
