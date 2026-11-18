@@ -206,8 +206,13 @@ async def create_job_idempotent(
     attribution: Optional[Dict[str, Any]],
     owner: str,
     key: str,
+    bild: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create the job for (owner, key) exactly once.
+
+    ``bild`` (Bild-PII-Maske, Bildvertrag v3 §2.2): {receipt_id, sha256, mime, principal, tenant}. Dann laufen
+    INSERT des Jobs und Verbrauch des Receipts in EINER Transaktion; jede Receipt-Abweichung wirft BildFehler und
+    rollt den Job mit zurueck. Replay (gleicher Schluessel, gleicher Digest): Receipt muss genau diesem Job gehoeren.
 
     Returns {"created": bool, "job": {job_id, kind, status}}. created=False is
     a replay: the job that already holds this key, whatever its status — the
@@ -226,6 +231,8 @@ async def create_job_idempotent(
     store, and raise."""
     digest = payload_digest(payload)
     pool = get_pool()
+    if bild is not None:
+        return await _create_job_idempotent_bild(pool, job_id, kind, payload, attribution, owner, key, digest, bild)
     async with pool.acquire() as conn:
         for _ in range(2):
             inserted = await conn.fetchval(
@@ -280,6 +287,42 @@ async def create_job_idempotent(
         f"create_job_idempotent: key conflict on ({owner!r}, {key!r}) twice without "
         f"a row holding it — the unique index and the table disagree"
     )
+
+
+async def _create_job_idempotent_bild(pool, job_id, kind, payload, attribution, owner, key, digest, bild):
+    from src.privacy_image import speicher as _bs
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO ai_jobs (job_id, kind, status, payload, payload_digest,
+                                     attribution, idempotency_owner, idempotency_key)
+                VALUES ($1, $2, 'pending', $3::jsonb, $4, $5::jsonb, $6, $7)
+                ON CONFLICT (idempotency_owner, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL
+                DO NOTHING
+                RETURNING job_id
+                """,
+                job_id, kind,
+                json.dumps(payload, default=str) if payload is not None else None,
+                digest,
+                json.dumps(attribution, default=str) if attribution is not None else None,
+                owner, key,
+            )
+            if inserted is not None:
+                await _bs.verbrauch_in_tx(conn, receipt_id=bild["receipt_id"], job_id=inserted, sha256=bild["sha256"],
+                                          mime=bild["mime"], principal=bild["principal"], tenant=bild["tenant"])
+                return {"created": True, "job": {"job_id": inserted, "kind": kind, "status": JOB_STATUS_PENDING}}
+            row = await conn.fetchrow(
+                "SELECT job_id, kind, status, payload_digest FROM ai_jobs "
+                "WHERE idempotency_owner = $1 AND idempotency_key = $2", owner, key)
+            if row is None:
+                raise RuntimeError("create_job_idempotent(bild): key conflict without a row; no retry for image jobs")
+            if row["kind"] != kind or row["payload_digest"] != digest:
+                raise IdempotencyKeyReused(row["job_id"])
+            await _bs.replay_pruefen(conn, receipt_id=bild["receipt_id"], job_id=row["job_id"])
+            return {"created": False, "job": {"job_id": row["job_id"], "kind": row["kind"], "status": row["status"]}}
 
 
 async def get_job(job_id: str) -> Optional[Dict[str, Any]]:

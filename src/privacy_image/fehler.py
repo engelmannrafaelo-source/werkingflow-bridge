@@ -28,6 +28,8 @@ _TEXTE = {
     "image_receipt_confirmation_missing": "Bestaetigung fehlt oder unplausibel",
     "image_empty_requires_second_confirmation": "keine Schrift erkannt: Zweitbestaetigung noetig",
     "image_route_not_allowed": "Bildweg fuer diese Route nicht freigegeben",
+    "image_content_not_allowed": "Bildform nicht zugelassen",
+    "image_receipt_time_implausible": "Bestaetigungszeit unplausibel",
     "feature_disabled": "Funktion nicht aktiviert",
     "image_receipt_consumed": "Receipt schon verbraucht",
     "image_receipt_conflict": "Receipt-Konflikt",
