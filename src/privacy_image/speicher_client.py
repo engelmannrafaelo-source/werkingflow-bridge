@@ -25,7 +25,10 @@ def _antwort(resp, op: str):
     body = resp.json if isinstance(resp.json, dict) else {}
     d = body.get("detail")
     if isinstance(d, dict) and d.get("reason") == "bild":
-        raise BildFehler(resp.status_code, str(d.get("code")))
+        try:
+            raise BildFehler(resp.status_code, str(d.get("code")))
+        except ValueError:
+            raise BildFehler(503, "image_mask_unavailable")
     if resp.status_code not in (200, 201):
         logger.error("privacy-image %s: platform-api status %s", op, resp.status_code)
         raise BildFehler(503, "image_mask_unavailable")

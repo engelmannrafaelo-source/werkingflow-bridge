@@ -65,6 +65,10 @@ def pruefen(token: str, *, jetzt: Optional[int] = None, schluessel: Optional[byt
         roh, sig = _unb64(teil_roh), _unb64(teil_sig)
     except (ValueError, AttributeError):
         raise BildFehler(403, "image_final_token_invalid")
+    if _b64(roh) + "." + _b64(sig) != token:
+        # nur die kanonische Schreibweise: sonst ergaeben Padding-/Alphabet-Varianten desselben Tokens verschiedene
+        # token_hash-Werte und damit mehrere Receipts aus einem Token (A-SS-3)
+        raise BildFehler(403, "image_final_token_invalid")
     if not hmac.compare_digest(hmac.new(k, roh, hashlib.sha256).digest(), sig):
         raise BildFehler(403, "image_final_token_invalid")
     try:

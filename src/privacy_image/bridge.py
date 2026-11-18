@@ -95,18 +95,24 @@ async def image_mask(request: Request, privacy_client, privacy_timeout) -> JSONR
                 raise BildFehler(resp.status_code, str(code))
             except ValueError:
                 raise BildFehler(503, "image_mask_unavailable")
+        if not isinstance(daten, dict):
+            raise BildFehler(503, "image_mask_unavailable")
         if anfrage.modus == "final":
-            m = daten.get("modell") or {}
             try:
-                bytes_ = base64.b64decode(m.get("b64", ""), validate=True)
-            except (binascii.Error, ValueError):
-                raise BildFehler(503, "image_mask_unavailable")
-            if hashlib.sha256(bytes_).hexdigest() != m.get("sha256") or daten.get("eingang_sha256") != anfrage.eingang_sha256:
-                raise BildFehler(503, "image_mask_unavailable")
-            t = token.ausstellen(sha256=m["sha256"], mime=m["mime"], leer=bool(daten["automaske"]["leer"]),
-                                 principal=principal, tenant=tenant, breite=int(m["breite"]), hoehe=int(m["hoehe"]),
-                                 automasken=int(daten["automaske"]["masken"]),
-                                 handmasken=int(daten.get("handmasken_angewendet", 0)))
+                m = daten["modell"]
+                bytes_ = base64.b64decode(m["b64"], validate=True)
+                if hashlib.sha256(bytes_).hexdigest() != m["sha256"] or daten["eingang_sha256"] != anfrage.eingang_sha256 \
+                        or m["mime"] not in ("image/png", "image/jpeg") or type(daten["automaske"]["leer"]) is not bool:
+                    raise BildFehler(503, "image_mask_unavailable")
+                felder = dict(sha256=m["sha256"], mime=m["mime"], leer=daten["automaske"]["leer"],
+                              breite=int(m["breite"]), hoehe=int(m["hoehe"]),
+                              automasken=int(daten["automaske"]["masken"]),
+                              handmasken=int(daten.get("handmasken_angewendet", 0)))
+            except BildFehler:
+                raise
+            except (binascii.Error, ValueError, KeyError, TypeError, AttributeError):
+                raise BildFehler(503, "image_mask_unavailable")   # Dienstantwort unvollstaendig: kein Token
+            t = token.ausstellen(principal=principal, tenant=tenant, **felder)
             daten["final_token"] = t["token"]
             daten["final_token_ablauf"] = datetime.fromtimestamp(t["ablauf"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         logger.info("image-mask %s ok: principal=%s masken=%s", anfrage.modus, principal,
@@ -150,9 +156,15 @@ async def image_receipt(request: Request) -> JSONResponse:
             raise BildFehler(403, "image_receipt_time_implausible")
         if f["leer"] and a.leer_zweitbestaetigung is not True:
             raise BildFehler(403, "image_empty_requires_second_confirmation")
-        r = await speicher_client.receipt_anlegen(token_hash=token.token_hash(a.final_token), felder=f,
-                                                  app_id=pruefung.SCHEMA_APP_ID, bestaetigung_version="bild-v1",
-                                                  bestaetigt_um=um)
+        try:
+            r = await speicher_client.receipt_anlegen(token_hash=token.token_hash(a.final_token), felder=f,
+                                                      app_id=pruefung.SCHEMA_APP_ID, bestaetigung_version="bild-v1",
+                                                      bestaetigt_um=um)
+        except BildFehler:
+            raise
+        except Exception as e:  # noqa: BLE001 — Speicher nicht verfuegbar: laut, ohne Inhalte
+            logger.error("image-receipt: Speicher-Fehler (%s)", type(e).__name__)
+            raise BildFehler(503, "image_mask_unavailable")
         exp = r["expires_at"]
         exp = exp if isinstance(exp, str) else exp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         logger.info("image-receipt angelegt: sha=%s hand=%s auto=%s", f["sha256"][:12], f["handmasken"], f["automasken"])
