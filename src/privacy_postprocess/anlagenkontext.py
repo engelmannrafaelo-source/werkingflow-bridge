@@ -550,10 +550,13 @@ async def kontext_verifiziert(request: Any, context_hint: Optional[str], *, aufr
     from src.routing.schema_bedrock_guard import SCHEMA_APP_ID
     if _resolve_app_id(request) == (SCHEMA_APP_ID, "principal"):
         return True
-    from src.jobs.selbstaufruf import JOB_LAUF_HEADER
-    job_id = (request.headers.get(JOB_LAUF_HEADER) or "").strip()
+    from src.jobs.selbstaufruf import JOB_KONTEXT_HEADER, JOB_LAUF_HEADER
+    job_id = (request.headers.get(JOB_KONTEXT_HEADER) or request.headers.get(JOB_LAUF_HEADER) or "").strip()
     peer = getattr(getattr(request, "client", None), "host", None)
     if not job_id or peer not in ("127.0.0.1", "::1"):
+        # Live-FAIL 7740f932 lief still hier hinaus: Grund sichtbar machen (nur Code, keine Inhalte/Kennungen).
+        logger.warning("privacy anlagenkontext: nicht verifiziert (%s) — unchanged masking",
+                       "kein-job-kopf" if not job_id else "peer-nicht-loopback")
         return False
     from src.jobs import store_client
     try:
@@ -562,7 +565,11 @@ async def kontext_verifiziert(request: Any, context_hint: Optional[str], *, aufr
         logger.error("privacy anlagenkontext: job store not readable (%s) — unchanged masking", type(e).__name__)
         return False
     if not isinstance(job, dict) or job.get("status") != "running":
+        logger.warning("privacy anlagenkontext: nicht verifiziert (job-nicht-laufend) — unchanged masking")
         return False
     attr = job.get("attribution") or {}
-    return (attr.get(JOB_SCHEMA_VERIFIZIERT_KEY) is True and attr.get("app_id") == SCHEMA_APP_ID
-            and aufrufer_user_id is not None and attr.get("user_id") == aufrufer_user_id)
+    ok = (attr.get(JOB_SCHEMA_VERIFIZIERT_KEY) is True and attr.get("app_id") == SCHEMA_APP_ID
+          and aufrufer_user_id is not None and attr.get("user_id") == aufrufer_user_id)
+    if not ok:
+        logger.warning("privacy anlagenkontext: nicht verifiziert (job-merkmal) — unchanged masking")
+    return ok

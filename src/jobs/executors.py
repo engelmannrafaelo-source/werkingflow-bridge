@@ -437,6 +437,13 @@ def _build_headers(attribution: Optional[Dict[str, Any]]) -> Dict[str, str]:
     job_id = laufender_job()
     if job_id:
         headers[JOB_LAUF_HEADER] = job_id
+    # Privacy-Anlagenkontext: Schema-Proxy-Job nennt sich dem Endpunkt (nur dort gesetzt, registry._kontext_job_fuer).
+    from src.jobs.registry import kontext_job
+    from src.jobs.selbstaufruf import JOB_KONTEXT_HEADER
+
+    kjob = kontext_job()
+    if kjob:
+        headers[JOB_KONTEXT_HEADER] = kjob
     return headers
 
 
