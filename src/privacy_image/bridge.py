@@ -202,7 +202,13 @@ async def chat_pruefen(request: Request) -> Optional[JSONResponse]:
             raise BildFehler(503, "image_mask_unavailable")
         if not isinstance(job, dict) or job.get("status") != "running" or job.get("kind") != "chat":
             raise BildFehler(403, "image_receipt_invalid")
-        r = await speicher_client.receipt_fuer_job(job_id)
+        try:
+            r = await speicher_client.receipt_fuer_job(job_id)
+        except BildFehler:
+            raise
+        except Exception as e:  # noqa: BLE001 — Speicher nicht verfuegbar: fail-closed, laut, ohne Inhalte
+            logger.error("schema-chat bild: Speicher-Fehler (%s)", type(e).__name__)
+            raise BildFehler(503, "image_mask_unavailable")
         if r is None or r.get("receipt_id") != b.receipt_id:
             raise BildFehler(403, "image_receipt_invalid")
         attr = job.get("attribution") or {}
@@ -211,8 +217,7 @@ async def chat_pruefen(request: Request) -> Optional[JSONResponse]:
         if r.get("sha256") != b.sha256 or r.get("mime") != b.mime:
             raise BildFehler(403, "image_receipt_sha_mismatch")
         # §4 fail-closed: Bindung ist gueltig, aber kein Bildweg ist freigegeben.
-        if not FREIGEGEBENE_BILDROUTEN:
-            raise BildFehler(403, "image_route_not_allowed")
+        # Auch eine nicht-leere Liste oeffnet hier nichts: der Bildweg selbst ist noch nicht gebaut (Code + Review + SEC).
         raise BildFehler(403, "image_route_not_allowed")
     except BildFehler as f:
         logger.info("schema-chat bild abgewiesen: %s %s", f.status, f.code)
