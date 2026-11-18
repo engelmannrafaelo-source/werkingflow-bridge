@@ -216,6 +216,8 @@ def pruefe(b, beleg):
     rot = 0
     test = b.mandanten("test")
     for e in beleg["paare"]:
+        if e.get("tenant_angelegt") is not True:
+            zeile(f"FAIL pruefen {e['kennung']}: Anlage des Mandanten nicht belegt"); rot += 1; continue
         if not e.get("user_id"):
             zeile(f"FAIL pruefen {e['kennung']}: kein Nutzer im Beleg"); rot += 1; continue
         ok, j, st = nutzer_beweis(b, e)
@@ -241,6 +243,14 @@ def abbauen(b, a):
         n = {"kennung": e["kennung"], "tenant_id": e["tenant_id"], "user_id": e.get("user_id")}
         nachweis["paare"].append(n)
         tid = e["tenant_id"]
+        # A-L-1 (Review R1): nur Mandanten, deren Anlage DURCH DIESES WERKZEUG belegt ist (POST 201). Ein 409
+        # (fremd angelegt zwischen Vorpruefung und POST) oder ein Zeitueberschreiten laesst die Anlage offen →
+        # nie loeschen, melden. Ohne belegte Mandantenanlage kann es auch keinen eigenen Nutzer geben.
+        n["tenant_angelegt"] = e.get("tenant_angelegt") is True
+        if not n["tenant_angelegt"]:
+            rot += 1
+            zeile(f"FAIL abbauen {e['kennung']}: Anlage des Mandanten nicht belegt — KEIN DELETE")
+            continue
         n["tenant_typ_test"] = tid in test
         m = mitglieder(b, tid)
         if e.get("user_id"):
@@ -254,6 +264,15 @@ def abbauen(b, a):
                 continue
             st, _ = b.req("DELETE", f"/v1/users/{e['user_id']}")
             n["delete_user_status"] = st
+            if st == 409:
+                # Fremdschluessel (z. B. Usage/Ledger nach einem echten Lauf mit Login/KI). Fail-closed: Mandant bleibt.
+                # Bereinigung ist ein EIGENER, benannter Schritt ausserhalb dieses Werkzeugs (Operator:
+                # POST /v1/users/{id}/anonymize bzw. Usage-Bereinigung), danach `abbauen` erneut mit demselben Beleg.
+                rot += 1
+                n["bereinigung_noetig"] = True
+                zeile(f"FAIL abbauen {e['kennung']}: DELETE user 409 (Fremdschluessel) — Mandant bleibt; "
+                      f"Bereinigung als eigener Schritt (anonymize/Usage), dann abbauen erneut")
+                continue
             st2, _ = b.req("GET", f"/v1/users/{e['user_id']}")
             n["readback_user_404"] = st2 == 404
         else:
