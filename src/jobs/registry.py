@@ -234,6 +234,29 @@ def laufender_job() -> Optional[str]:
     return _job_lauf.get()
 
 
+# Privacy-Anlagenkontext (c9a50d3b 18.11.2026): ein proxy-Job ist nicht abbrechbar (BR10b, kein _job_lauf), sein
+# Selbstaufruf muss dem Endpunkt aber den Job nennen, damit kontext_verifiziert das bei POST /v1/jobs serverseitig
+# gesetzte Merkmal lesen kann. NUR kind "proxy" UND Merkmal ``schema_app_principal_verifiziert is True`` — jede
+# andere App/Art bleibt byte-gleich (kein Kopf).
+_job_kontext: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "bridge_job_kontext", default=None
+)
+JOB_KONTEXT_KINDS = frozenset({"proxy"})
+
+
+def kontext_job() -> Optional[str]:
+    """Id des Schema-Proxy-Jobs, dessen Selbstaufruf in diesem Task laeuft, sonst None."""
+    return _job_kontext.get()
+
+
+def _kontext_job_fuer(job_id: str, kind: str, attribution: Optional[Dict[str, Any]]) -> Optional[str]:
+    from src.privacy_postprocess.anlagenkontext import JOB_SCHEMA_VERIFIZIERT_KEY
+
+    if kind in JOB_KONTEXT_KINDS and (attribution or {}).get(JOB_SCHEMA_VERIFIZIERT_KEY) is True:
+        return job_id
+    return None
+
+
 def job_code_fields_for(code: str) -> Dict[str, Any]:
     """mark_error kwargs for an error that is fully described by its code."""
     return {"code": code, **job_code_fields(code)}
@@ -437,7 +460,14 @@ async def _ausfuehren(
         )
 
     if kind not in JOB_ABBRECHBAR_IM_LAUF or not (attribution or {}).get(EIGENTUEMER_KEY):
-        return await executor(payload, attribution, report_progress)
+        kontext = _kontext_job_fuer(job_id, kind, attribution)
+        if kontext is None:
+            return await executor(payload, attribution, report_progress)
+        ktoken = _job_kontext.set(kontext)
+        try:
+            return await executor(payload, attribution, report_progress)
+        finally:
+            _job_kontext.reset(ktoken)
     token = _job_lauf.set(job_id)
     try:
         return await executor(payload, attribution, report_progress)

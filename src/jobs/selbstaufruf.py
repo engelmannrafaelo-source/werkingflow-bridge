@@ -60,6 +60,11 @@ T = TypeVar("T")
 
 # Marks a job's self-call; carries the job id (executors._build_headers).
 JOB_LAUF_HEADER = "X-Bridge-Job-Lauf"
+# Job-Kennung im Selbstaufruf eines Schema-Proxy-Jobs (Privacy-Anlagenkontext, c9a50d3b 18.11.2026, Live-FAIL
+# 7740f932): KEIN Abbruch-Vertrag (proxy bleibt BR10b), nur die Job-Zuordnung, gegen die
+# privacy_postprocess.anlagenkontext.kontext_verifiziert das serverseitige Jobmerkmal prueft. Vertrauen wie beim
+# Lauf-Kopf: nur vom Loopback-Peer und nur fuer einen LAUFENDEN Job mit Merkmal, App und Nutzer.
+JOB_KONTEXT_HEADER = "X-Bridge-Job-Kontext"
 # The endpoint's confirmation that it stopped a job's run (value BESTAETIGT).
 ABBRUCH_HEADER = "X-Bridge-Job-Abgebrochen"
 BESTAETIGT = "bestaetigt"
