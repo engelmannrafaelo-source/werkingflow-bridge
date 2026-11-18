@@ -41,6 +41,9 @@ FREIGEGEBENE_BILDROUTEN: frozenset = frozenset({ROUTE_SCHEMA_DIRECT})
 ROUTE_ENV = "BRIDGE_PRIVACY_IMAGE_ROUTE"
 #: Eigener Bild-Privacy-Dienst (OCR), getrennt vom geteilten Text-Privacy-Dienst. Fehlt die URL: 503, kein Rueckfall.
 DIENST_URL_ENV = "PRIVACY_IMAGE_SERVICE_URL"
+#: Eigenes Token NUR fuer den Bild-Dienst (nicht das geteilte PRIVACY_SERVICE_TOKEN des Text-Dienstes). Fehlt es
+#: oder ist es kuerzer als 32 Zeichen: 503, kein Aufruf.
+DIENST_TOKEN_ENV = "PRIVACY_IMAGE_SERVICE_TOKEN"
 
 
 def _fehler(f: BildFehler) -> JSONResponse:
@@ -73,18 +76,21 @@ def bild_backend_fehler(request: Request, *, strict: bool, backend, stream: bool
     return None
 
 
-_dienst = {"url": None, "client": None}
+_dienst = {"url": None, "token": None, "client": None}
 
 
 def _bild_dienst():
-    """httpx-Client fuer den Bild-Privacy-Dienst (PRIVACY_IMAGE_SERVICE_URL). Ohne URL: 503 (nie der Text-Dienst)."""
+    """httpx-Client fuer den Bild-Privacy-Dienst (PRIVACY_IMAGE_SERVICE_URL + PRIVACY_IMAGE_SERVICE_TOKEN als Bearer).
+    Ohne URL/Token: 503 (nie der Text-Dienst, nie ohne Token)."""
     url = (os.environ.get(DIENST_URL_ENV) or "").strip().rstrip("/")
-    if not url.startswith(("http://", "https://")):
+    tok = (os.environ.get(DIENST_TOKEN_ENV) or "").strip()
+    if not url.startswith(("http://", "https://")) or len(tok) < 32:
         raise BildFehler(503, "image_mask_unavailable")
-    if _dienst["client"] is None or _dienst["url"] != url:
+    if _dienst["client"] is None or _dienst["url"] != url or _dienst["token"] != tok:
         import httpx
-        _dienst["client"] = httpx.AsyncClient(base_url=url, follow_redirects=False)
-        _dienst["url"] = url
+        _dienst["client"] = httpx.AsyncClient(base_url=url, follow_redirects=False,
+                                              headers={"Authorization": f"Bearer {tok}"})
+        _dienst["url"], _dienst["token"] = url, tok
     return _dienst["client"]
 
 
