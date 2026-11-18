@@ -3393,7 +3393,12 @@ deploy_server() {
             fi
         fi
         if (( dos_rc == 0 )); then
-            :
+            # P1/BR7: read-only record right after the platform-api gap — which
+            # jobs are active or parked now (never changes the deploy result).
+            if [[ "$svc" == platform-api && "$DRY_RUN" == "false" ]] \
+                    && platform_api_job_gate_needed "$server_prefix" "${services_to_deploy[@]}"; then
+                platform_api_job_gate_nachher "$server_prefix"
+            fi
         else
             error_ "Deploy failed for ${svc} (rc=${dos_rc}) — initiating rollback of recreated services only"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then

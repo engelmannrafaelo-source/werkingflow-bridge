@@ -32,6 +32,21 @@
 
 PLATFORM_API_JOBGATE_POLL_S="${PLATFORM_API_JOBGATE_POLL_S:-10}"
 
+# P1 (SEC 18.11.2026, Auftrag 692bcf6c): the peer half of the gate is asked
+# from the PEER's own side. For a dev (HETZNER) deploy the question "which jobs
+# in the prod store have dev as budget home?" is asked over the regular SSH
+# path into a prod WORKER on the prod worker host, against that worker's own
+# platform-api with that worker's own credential (in its process only). No prod
+# credential lives on dev, none travels in argv or logs. Binding is exact:
+#   host      : `hostname` on the SSH target == PLATFORM_API_JOBGATE_REMOTE_HOSTNAME
+#   container : exact name from the WORKERHOST_SVC_* list, running
+#   origin    : BRIDGE_ORIGIN_ID inside the container == "prod" (checked by the probe)
+# Anything else (SSH failure, timeout, wrong host/container/origin, malformed
+# answer) is an error and refuses the recreation. active OR waiting > 0 is busy.
+# Fixed on purpose (not overridable from the environment): the exact host the prod store is asked from.
+readonly PLATFORM_API_JOBGATE_REMOTE_HOSTNAME="prod-workers-1"
+PLATFORM_API_JOBGATE_REMOTE_TIMEOUT_S=60
+
 # Services whose recreation leaves the platform-api without an answer: the
 # platform-api itself and, where it runs next to it, its database.
 #   $1 = server prefix (HETZNER | SERVER2 | WORKERHOST), rest = services
@@ -66,22 +81,114 @@ platform_api_job_gate_probe_site() {
     esac
 }
 
+# Peers asked from their own side (P1) and where:
+#   $1 = server prefix. Prints "<peer> <own-origin-there> <home-origin> <host> <containers...>"
+#   or nothing (no remote peer for this prefix: the local probe asks every peer itself).
+platform_api_job_gate_remote_site() {
+    case "$1" in
+        HETZNER)
+            echo "prod prod dev ${WORKERHOST_HOST} ${WORKERHOST_SVC_worker_sahori} ${WORKERHOST_SVC_worker_kurt} ${WORKERHOST_SVC_worker_coach} ${WORKERHOST_SVC_worker_erk}"
+            ;;
+    esac
+}
+
 # One probe run. Output goes to stdout; returns the probe's exit code
-# (0 idle, 1 busy, 2 not provable, 3 endpoint missing).
+# (0 idle, 1 busy, 2 not provable, 3 endpoint missing, 4 remote peer pending).
+#   $1 = host, $2 = extra probe arguments ("" or "--peer-remote <name>"), rest = containers
 platform_api_job_gate_probe() {
-    local host="$1"; shift
+    local host="$1" extra="$2"; shift 2
     local container
     for container in "$@"; do
         if rssh "$host" "docker inspect --format '{{.State.Running}}' '${container}' 2>/dev/null" \
                 | grep -qx true; then
             local rc=0
-            rssh "$host" "docker exec -i '${container}' python3 -" \
+            rssh "$host" "docker exec -i '${container}' python3 - ${extra}" \
                 < "$(dirname "${BASH_SOURCE[0]}")/platform_api_job_gate.py" || rc=$?
             return "$rc"
         fi
     done
     echo "no running worker among: $*"
     return 2
+}
+
+# Remote (peer-side) probe, P1. Returns 0 idle, 1 busy, 2 error (fail-closed).
+#   $1 = own origin over there (e.g. prod), $2 = home origin asked for (e.g. dev),
+#   $3 = host, rest = allowed containers (exact names)
+platform_api_job_gate_remote_probe() {
+    local eigen="$1" heimat="$2" host="$3"; shift 3
+    local seen_host container state rc
+    seen_host=$(rssh "$host" "hostname" 2>/dev/null) || { echo "remote ${eigen}: ssh to ${host} failed"; return 2; }
+    if [[ "$seen_host" != "$PLATFORM_API_JOBGATE_REMOTE_HOSTNAME" ]]; then
+        echo "remote ${eigen}: host ${host} is '${seen_host}', expected '${PLATFORM_API_JOBGATE_REMOTE_HOSTNAME}'"
+        return 2
+    fi
+    for container in "$@"; do
+        [[ "$container" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "remote ${eigen}: bad container name"; return 2; }
+        state=$(rssh "$host" "docker inspect --format '{{.Name}} {{.State.Running}}' '${container}' 2>/dev/null" 2>/dev/null) || continue
+        [[ "$state" == "/${container} true" ]] || continue
+        rc=0
+        rssh "$host" "timeout ${PLATFORM_API_JOBGATE_REMOTE_TIMEOUT_S} docker exec -i '${container}' python3 - --eigen '${eigen}' --heimat '${heimat}'" \
+            < "$(dirname "${BASH_SOURCE[0]}")/platform_api_job_gate_heimat.py" || rc=$?
+        case "$rc" in
+            0|1) return "$rc" ;;
+            *) echo "remote ${eigen}: probe in ${container} rc=${rc}"; return 2 ;;
+        esac
+    done
+    echo "remote ${eigen}: no running container among: $* on ${seen_host}"
+    return 2
+}
+
+# Combined verdict of the local probe and the remote peer probes (P1).
+# Prints the probe output; returns 0 idle, 1 busy, 2 not provable, 3 endpoint missing.
+#   $1 = server prefix
+platform_api_job_gate_round() {
+    local prefix="$1" site remote extra="" rc_local=0 rc_remote rc_all
+    local peer eigen heimat rhost
+    site=$(platform_api_job_gate_probe_site "$prefix") || { echo "no probe site for ${prefix}"; return 2; }
+    remote=$(platform_api_job_gate_remote_site "$prefix")
+    if [[ -n "$remote" ]]; then
+        read -r peer eigen heimat rhost _ <<< "$remote"
+        extra="--peer-remote ${peer}"
+    fi
+    # shellcheck disable=SC2086
+    platform_api_job_gate_probe ${site%% *} "$extra" ${site#* } || rc_local=$?
+    if [[ -z "$remote" ]]; then
+        # rc 4 without a configured remote probe can never be a release.
+        [[ "$rc_local" == 4 ]] && { echo "local probe wants a remote peer probe, none configured"; return 2; }
+        return "$rc_local"
+    fi
+    rc_remote=0
+    # shellcheck disable=SC2086
+    platform_api_job_gate_remote_probe "$eigen" "$heimat" "$rhost" $(cut -d' ' -f5- <<< "$remote") || rc_remote=$?
+    # Precedence like the probe itself: error > busy > missing > idle.
+    # The local answer must be 4 (peer pending) or busy/missing/error; a local 0
+    # while a remote peer is configured means the peer was not named -> error.
+    case "$rc_local" in
+        0) echo "local probe did not mark peer ${peer} as remote"; return 2 ;;
+        2) return 2 ;;
+    esac
+    [[ "$rc_remote" == 2 ]] && return 2
+    [[ "$rc_local" == 1 || "$rc_remote" == 1 ]] && return 1
+    [[ "$rc_local" == 3 ]] && return 3
+    [[ "$rc_local" == 4 && "$rc_remote" == 0 ]] && return 0
+    rc_all=2
+    return "$rc_all"
+}
+
+# Read-only record right AFTER the recreation (P1/BR7): which jobs are active or
+# parked now. Never changes the deploy result; every listed job is handed to its
+# existing owner by the operator (no drain claim, no blind retry).
+#   $1 = server prefix
+platform_api_job_gate_nachher() {
+    local prefix="$1" out rc=0
+    out=$(platform_api_job_gate_round "$prefix" 2>&1) || rc=$?
+    while IFS= read -r line; do info "  JOBGATE-NACHHER: $line"; done <<< "$out"
+    case "$rc" in
+        0) info "JOBGATE-NACHHER: idle (no active/waiting job depends on this platform-api)" ;;
+        1) warn "JOBGATE-NACHHER: jobs active or parked after the recreation — follow each listed job up with its owner (BR7 parking is retryable, no blind retry)" ;;
+        *) warn "JOBGATE-NACHHER: state not provable after the recreation (rc=${rc}) — report, follow up by hand" ;;
+    esac
+    return 0
 }
 
 # Returns 0 = go ahead and recreate, 3 = refused (platform-api untouched).
@@ -100,13 +207,12 @@ platform_api_job_gate() {
     fi
     local deadline=$(( $(date +%s) + wait_s ))
     local out rc
-    # shellcheck disable=SC2086
     while :; do
         rc=0
-        out=$(platform_api_job_gate_probe $site 2>&1) || rc=$?
+        out=$(platform_api_job_gate_round "$prefix" 2>&1) || rc=$?
         while IFS= read -r line; do info "  job gate: $line"; done <<< "$out"
         if [[ "$DRY_RUN" == "true" ]]; then
-            info "[DRY-RUN] platform-api job gate result rc=${rc} (0 idle, 1 busy, 2 not provable, 3 endpoint missing) — no wait in dry-run"
+            info "[DRY-RUN] platform-api job gate result rc=${rc} (0 idle, 1 busy, 2 not provable, 3 endpoint missing) — no wait in dry-run; a real run would $([[ "$rc" == 0 ]] && echo recreate || echo 'NOT recreate')"
             return 0
         fi
         case "$rc" in
