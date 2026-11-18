@@ -4059,6 +4059,18 @@ async def _chat_completions_lauf(
         # Hinter diesem Punkt liegen ALLE Backend-Zweige (Bedrock, Vertex, anthropic_direct, OpenAI, Gemini, SDK).
         # =======================================================================
         _strict_dispatch = extract_attribution_context(request).get("app_id") == "werking-schema-generator"
+        # Bild-PII-Maske §4 (SEC 18.11.): ein gebundener Bild-Request (chat_pruefen: Receipt/Job/sha/Tenant geprueft) darf
+        # NUR strikt dispatcht auf dem anthropic_direct-Vision-Weg ohne Stream laufen; die drei Schloesser + Modell
+        # prueft der strikte Block unten. Sonst 403, keine Umleitung (src/privacy_image/bridge.py bild_backend_fehler).
+        from src.privacy_image.bridge import bild_backend_fehler as _bild_backend_fehler
+        _bild_bf = _bild_backend_fehler(request, strict=_strict_dispatch,
+                                        backend=(backend_config.backend if backend_config else None),
+                                        stream=bool(request_body.stream))
+        if _bild_bf is not None:
+            raise HTTPException(status_code=403, detail={
+                "error": _bild_bf, "appId": "werking-schema-generator",
+                "message": "Für Bilder ist nur der freigegebene Bildweg zulässig.",
+            })
         if _strict_dispatch:
             # Zugelassen: Bedrock (Ein-Versuch-Client) und Vertex EU (ein einziger httpx-POST, call_vertex_eu), jeweils
             # ohne Stream. Welche der beiden, entscheidet allein der Schema-Guard oben (Operator-Pin).

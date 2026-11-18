@@ -6,7 +6,7 @@
   image_receipt(request)  POST /v1/privacy/image-receipt  Token, Principal/Tenant, sha/MIME, Zeit (+-60 s), leer ->
                                                           Zweitbestaetigung; ein Token = ein Receipt (409).
   chat_pruefen(request)   im Chat-Handler fuer die Schema-App: None = reiner Text (unveraendert); sonst Pruefung
-                          Selbstaufruf/Job/Receipt/Principal/Tenant/sha und danach §4 fail-closed (403 image_route_not_allowed).
+                          Selbstaufruf/Job/Receipt/Principal/Tenant/sha; danach §4: None nur auf dem freigegebenen Weg (request.state.bild_route), sonst 403.
 
 Nie Inhalte in Logs oder Fehlern (nur Codes, Laengen, sha12).
 """
@@ -31,9 +31,16 @@ logger = logging.getLogger(__name__)
 
 FLAG_ENV = "BRIDGE_PRIVACY_IMAGE_MASK"
 KOPF = {"Cache-Control": "no-store"}
-#: §4 (Bildvertrag v3/v4, Kanzler 18:09:51Z): KEIN Bildweg ist freigegeben, bis Rafael/SEC entscheiden. Bewusst
-#: hart kodiert und leer (kein Env-Schalter, der den Weg still oeffnen koennte). Aenderung nur per Code + Review.
-FREIGEGEBENE_BILDROUTEN: frozenset = frozenset()
+#: §4 (SEC-Bildentscheid 18.11.2026 abends): genau EIN Bildweg ist im Code bekannt, der bestehende anthropic_direct-
+#: Vision-Weg ueber den Bridge-Worker fuer die Schema-App (API/credit-finanziert, kein Abo, kein Bedrock/Gemini, kein
+#: Fallback). Er ist nur offen, wenn BRIDGE_PRIVACY_IMAGE_ROUTE exakt diesen Namen traegt UND die Bild-Schalter an sind.
+#: Die drei non-EU-Schloesser (Operator-Pin, Nutzerliste, Test-Principal) und das Modell prueft danach der strikte
+#: Schema-Dispatch in main.py fuer genau diesen Request; jede andere Backend-Aufloesung -> 403, keine Umleitung.
+ROUTE_SCHEMA_DIRECT = "schema-anthropic-direct"
+FREIGEGEBENE_BILDROUTEN: frozenset = frozenset({ROUTE_SCHEMA_DIRECT})
+ROUTE_ENV = "BRIDGE_PRIVACY_IMAGE_ROUTE"
+#: Eigener Bild-Privacy-Dienst (OCR), getrennt vom geteilten Text-Privacy-Dienst. Fehlt die URL: 503, kein Rueckfall.
+DIENST_URL_ENV = "PRIVACY_IMAGE_SERVICE_URL"
 
 
 def _fehler(f: BildFehler) -> JSONResponse:
@@ -43,6 +50,42 @@ def _fehler(f: BildFehler) -> JSONResponse:
 def _an() -> bool:
     return (os.environ.get("BRIDGE_ANONYMIZE_ENABLED", "").lower() == "true"
             and os.environ.get(FLAG_ENV, "").lower() == "true")
+
+
+def bildroute() -> Optional[str]:
+    """Der freigegebene Bildweg oder None (zu). Nur ein exakter, im Code bekannter Name zaehlt; Schalter muessen an sein."""
+    name = (os.environ.get(ROUTE_ENV) or "").strip()
+    return name if (name in FREIGEGEBENE_BILDROUTEN and _an()) else None
+
+
+def bild_backend_fehler(request: Request, *, strict: bool, backend, stream: bool) -> Optional[str]:
+    """Fuer einen von chat_pruefen gebundenen Bild-Request: Fehlercode, wenn er NICHT auf dem freigegebenen Weg laeuft.
+    None = kein Bild-Request oder Weg passt. Weg passt nur: strikter Schema-Dispatch, Backend anthropic_direct, kein
+    Stream. Bedrock/Vertex/Abo/Gemini/Pool/unaufgeloest -> Fehler (keine Umleitung)."""
+    route = getattr(getattr(request, "state", None), "bild_route", None)
+    if route is None:
+        return None
+    if route != ROUTE_SCHEMA_DIRECT or not strict or stream:
+        return "image_route_backend_mismatch"
+    wert = getattr(backend, "value", backend)
+    if str(wert) != "anthropic_direct":
+        return "image_route_backend_mismatch"
+    return None
+
+
+_dienst = {"url": None, "client": None}
+
+
+def _bild_dienst():
+    """httpx-Client fuer den Bild-Privacy-Dienst (PRIVACY_IMAGE_SERVICE_URL). Ohne URL: 503 (nie der Text-Dienst)."""
+    url = (os.environ.get(DIENST_URL_ENV) or "").strip().rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        raise BildFehler(503, "image_mask_unavailable")
+    if _dienst["client"] is None or _dienst["url"] != url:
+        import httpx
+        _dienst["client"] = httpx.AsyncClient(base_url=url, follow_redirects=False)
+        _dienst["url"] = url
+    return _dienst["client"]
 
 
 def _zaun(request: Request):
@@ -78,8 +121,9 @@ async def image_mask(request: Request, privacy_client, privacy_timeout) -> JSONR
         ct = request.headers.get("content-type", "")
         roh = await _koerper(request, formular.MAX_KOERPER_BYTES)
         anfrage = formular.maske_anfrage(formular.multipart_teile(ct, roh))   # Bridge prueft selbst, Dienst erneut
+        dienst = _bild_dienst()   # eigener Bild-Dienst; privacy_client (Text-Dienst) wird bewusst NICHT benutzt
         try:
-            resp = await privacy_client.post("/image-mask", content=roh, headers={"content-type": ct},
+            resp = await dienst.post("/image-mask", content=roh, headers={"content-type": ct},
                                              timeout=privacy_timeout(120.0))
         except Exception as e:  # noqa: BLE001 — Dienst nicht erreichbar: kein Rueckfall auf ungepruefte Bilder
             logger.error("image-mask: Privacy-Dienst nicht erreichbar (%s)", type(e).__name__)
@@ -216,9 +260,16 @@ async def chat_pruefen(request: Request) -> Optional[JSONResponse]:
             raise BildFehler(403, "image_receipt_principal_mismatch")
         if r.get("sha256") != b.sha256 or r.get("mime") != b.mime:
             raise BildFehler(403, "image_receipt_sha_mismatch")
-        # §4 fail-closed: Bindung ist gueltig, aber kein Bildweg ist freigegeben.
-        # Auch eine nicht-leere Liste oeffnet hier nichts: der Bildweg selbst ist noch nicht gebaut (Code + Review + SEC).
-        raise BildFehler(403, "image_route_not_allowed")
+        # §4: Bindung gueltig. Weiter nur auf dem einen freigegebenen Weg; sonst fail-closed.
+        route = bildroute()
+        if route is None:
+            raise BildFehler(403, "image_route_not_allowed")
+        # Der strikte Schema-Dispatch (main.py) erzwingt fuer genau diesen Request anthropic_direct + drei Schloesser
+        # + Modell; jede andere Backend-Aufloesung wird dort 403 (keine Umleitung).
+        request.state.bild_route = route
+        request.state.bild_receipt_id = b.receipt_id
+        logger.info("schema-chat bild: Bindung ok, route=%s receipt=%s", route, b.receipt_id[:8])
+        return None
     except BildFehler as f:
         logger.info("schema-chat bild abgewiesen: %s %s", f.status, f.code)
         return _fehler(f)
