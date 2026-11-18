@@ -102,7 +102,10 @@ echo 'PASS P1 remote: malformed container name is refused before ssh'
 rc=0; mit_frist 1 command sleep 5 || rc=$?; [[ $rc == 124 ]]
 rc=0; mit_frist 5 bash -c 'exit 3' || rc=$?; [[ $rc == 3 ]]
 [[ $(printf 'durch\n' | mit_frist 5 cat) == durch ]]
-echo 'PASS A-GP-3: mit_frist ends a hanging call with 124, keeps rc and stdin otherwise'
+# A function must NOT resume after the deadline (dcb97ae: subshell and children end in one kill).
+weiter=$(mktemp -u); f_weiter() { command sleep 5; : > "$weiter"; }
+rc=0; mit_frist 1 f_weiter || rc=$?; [[ $rc == 124 ]]; command sleep 1; [[ ! -e "$weiter" ]]
+echo 'PASS A-GP-3: mit_frist ends a hanging call with 124 (no resume after the deadline), keeps rc and stdin otherwise'
 haenge=""
 rssh_alt=$(declare -f rssh)
 rssh() { echo "rssh $*" >> "$commands"; [[ "$*" == *"$haenge"* && -n "$haenge" ]] && command sleep 30; [[ "$2" == hostname ]] && { echo prod-workers-1; return 0; }
