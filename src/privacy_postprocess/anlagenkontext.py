@@ -300,7 +300,14 @@ def _haengt_an_harter_pii(start: int, ende: int, text: str, harte_bereiche: List
 
 
 def _alle_vorkommen(text: str, wert: str) -> set:
-    return {(m.start(), m.end()) for m in re.finditer(re.escape(wert), text)}
+    """Vorkommen des Werts als eigenes Token: kein Buchstabe und keine Ziffer (Unicode) unmittelbar davor/danach.
+    "T-01" in "WT-01", "RLT-01", "T-012", "ÄT-01" ist eine ANDERE Kennung, kein Vorkommen von "T-01" (Privacy-FAIL
+    de364 18.11.: diese Teilwort-Stellen wurden als "eingebettet" zusaetzlich maskiert -> "WANON_..." -> contract.js
+    rejectContactRemnants 502). Gleiche Grenze wie die Retention-Gegenprobe (pipeline._technische_retentionen) und
+    der Mapping-Abgleich der Homepage (contract.js: (?<![\\p{L}\\p{N}])). Unterstrich und Satzzeichen sind KEINE
+    Grenze: "FI-01_alt", "Filter_FI-01", "/KV-01", "B-02-Neu" bleiben Vorkommen und werden wie bisher als
+    "eingebettet" maskiert (R3b, Adapter-Abgleich 451d80c)."""
+    return {(m.start(), m.end()) for m in re.finditer(r"(?<![^\W_])" + re.escape(wert) + r"(?![^\W_])", text)}
 
 
 def _texte(text: str) -> List[Tuple[int, int]]:
