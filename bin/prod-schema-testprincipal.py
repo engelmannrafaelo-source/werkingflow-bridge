@@ -61,9 +61,15 @@ ALLOWED_PATHS = ("/v1/chat/completions", "/v1/jobs", "/v1/jobs/*", "/v1/privacy/
 # Rafaels persoenliche Prod-IDs (BEFUND-RAFAEL-PROD-USERID): nie anfassen, nie gleich der Test-UUID.
 RAFAEL_IDS = frozenset({"c51392fb-0956-4a00-a052-d395ef411e1a", "dbde0f89-bad5-4d3b-b3a5-b21427e8dd03",
                         "be44fb61-5607-4a35-8726-70297a8f07d4", "53c3d016-0c2e-4c84-b49a-092204de44ad"})
-# Env-Namen der Homepage-Prod (48cf002d, ki.ts 3877e68 Z. 28-30). Pflichtparameter, muessen exakt diese sein.
-INF_NAMEN = {"schluessel": "SCHEMA_CHECK_BRIDGE_API_KEY", "url": "SCHEMA_CHECK_BRIDGE_URL",
-             "user": "SCHEMA_CHECK_PUBLIC_BRIDGE_USER_ID"}
+# Env-Namen der Homepage-Prod. FESTLEGUNG Kanzler 19.11.2026 00:01Z: Prod-Linie = Homepage-Paket 552766d5, Familie
+# SCHEMA_BRIDGE_* (Belege 48cf002d kz31.json, STAGING-BINDUNG-SCHEMA-c9a50d3b). SCHEMA_CHECK_*/SCHEMA_ERZEUGEN_* und
+# SCHEMA_ENABLED NICHT anfassen (die Check-Familie ist deshalb hier nicht zugelassen). Pflichtsatz: --namensfamilie mini
+# plus genau die fuenf --name-<rolle>; das Werkzeug prueft Satz und Namen exakt, nichts verdrahtet ohne Parameter.
+FAMILIEN = {
+    "mini": {"schluessel": "SCHEMA_BRIDGE_API_KEY", "url": "SCHEMA_BRIDGE_URL", "user": "SCHEMA_BRIDGE_USER_ID",
+             "tenant": "SCHEMA_BRIDGE_TENANT_ID", "app": "SCHEMA_BRIDGE_APP_ID"},
+}
+ROLLEN = ("schluessel", "url", "user", "tenant", "app")
 PROD = "https://prod-bridge.werking.tools"
 PROD_WORKER = ("http://100.93.143.105:8001", "http://100.93.143.105:8002",
                "http://100.93.143.105:8003", "http://100.93.143.105:8004")
@@ -225,9 +231,17 @@ class Ablage:
     """Infisical-Ablage ueber SECs regulaeren Weg (argv-Vertrag, Wert nur ueber Pipes)."""
 
     def __init__(self, a):
-        for k, soll in INF_NAMEN.items():
-            if getattr(a, f"name_{k}") != soll:
-                raise SystemExit(f"ABBRUCH --name-{k} muss {soll} sein (Homepage-Prod liest genau diesen Namen)")
+        fam = FAMILIEN.get(a.namensfamilie)
+        if fam is None:
+            raise SystemExit("ABBRUCH --namensfamilie muss mini sein (Festlegung Kanzler 00:01Z; SCHEMA_CHECK_* nicht anfassen)")
+        gegeben = {r: getattr(a, f"name_{r}") for r in ROLLEN if getattr(a, f"name_{r}") is not None}
+        if set(gegeben) != set(fam):
+            raise SystemExit(f"ABBRUCH Familie {a.namensfamilie} verlangt genau --name-{', --name-'.join(fam)} "
+                             f"(gegeben: {sorted(gegeben)})")
+        for r, soll in fam.items():
+            if gegeben[r] != soll:
+                raise SystemExit(f"ABBRUCH --name-{r} muss in Familie {a.namensfamilie} {soll} sein")
+        self.familie, self.namen = a.namensfamilie, dict(fam)
         if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", a.infisical_ws or ""):
             raise SystemExit("ABBRUCH --infisical-ws fehlt oder ist keine Workspace-UUID")
         if a.infisical_env != "prod":
@@ -290,7 +304,7 @@ def vorab(b, abl):
         hindernis.append("User existiert")
     if b.principals():
         hindernis.append("Principal existiert")
-    for k, name in INF_NAMEN.items():
+    for name in abl.namen.values():
         da, _ = abl.lies(name)
         if da:
             hindernis.append(f"Infisical-Name {name} existiert (kein Ueberschreiben)")
@@ -305,7 +319,7 @@ def anlegen(b, abl, a):
         raise Vorbedingung("VORHANDEN: " + "; ".join(h) + " — kein Write")
     zeile("PASS vorab: Plan 079, Tenant/User/Principal/Infisical-Namen frei")
     beleg = {"bridge_url": b.url, "erstellt_am": jetzt(), "tenant_id": TENANT_ID, "email": EMAIL, "principal": NAME,
-             "allowed_paths": list(ALLOWED_PATHS), "infisical": dict(abl.p), "namen": {}}
+             "allowed_paths": list(ALLOWED_PATHS), "infisical": dict(abl.p), "familie": abl.familie, "namen": {}}
     rc = 0
     try:
         st, _, _ = b.req("POST", "/v1/tenants", {"id": TENANT_ID, "name": TENANT_NAME, "account_type": "test",
@@ -386,7 +400,8 @@ def principal_anlegen(b, abl, beleg, uid):
     if not key.startswith("wsg_"):
         raise Abbruch("Schluessel ohne Praefix wsg_")
     beleg["schluessel"] = {"len": len(key), "fp8": fp8(key)}
-    werte = {INF_NAMEN["schluessel"]: key, INF_NAMEN["url"]: b.url, INF_NAMEN["user"]: uid}
+    quelle = {"schluessel": key, "url": b.url, "user": uid, "tenant": TENANT_ID, "app": APP}
+    werte = {name: quelle[r] for r, name in abl.namen.items()}
     for name, wert in werte.items():
         abl.schreib(name, wert)
     for name, wert in werte.items():
@@ -427,10 +442,11 @@ def pruefe(b, abl, beleg):
     for name, soll in (beleg.get("namen") or {}).items():
         da, ist = abl.lies(name)
         namen = namen and da and len(ist) == soll["len"] and fp8(ist) == soll["fp8"]
-    namen = namen and len(beleg.get("namen") or {}) == 3
+    namen = (namen and beleg.get("familie") == abl.familie
+             and sorted(beleg.get("namen") or {}) == sorted(abl.namen.values()))
     alles = ok_id and lizenz and pin and typ and allein and pr_ok and namen
     zeile(f"{'PASS' if alles else 'FAIL'} pruefen: identitaet={ok_id} lizenz_nur_schema={lizenz} pin={pin} typ_test={typ} "
-          f"einziges_mitglied={allein} principal={pr_ok} infisical_3_namen={namen}")
+          f"einziges_mitglied={allein} principal={pr_ok} infisical_familie_{abl.familie}={namen}")
     return 0 if alles else 1
 
 
@@ -465,7 +481,7 @@ def schloss(b, abl, a, beleg):
     seit = int(time.time()) - int(beleg.get("pin_gesetzt_epoch") or 0)
     if seit < a.pin_wartezeit:
         raise Vorbedingung(f"Pin erst {seit} s alt; N-B fruehestens nach {a.pin_wartezeit} s (Worker-Cache 60 s)")
-    da, key = abl.lies(INF_NAMEN["schluessel"])
+    da, key = abl.lies(abl.namen["schluessel"])
     if not da or fp8(key) != (beleg.get("schluessel") or {}).get("fp8"):
         raise Abbruch("Schluessel in Infisical fehlt oder Fingerabdruck != Anlagebeleg")
     vor = spuren(a, uid)
@@ -499,7 +515,7 @@ def lade_beleg(pfad, url):
 def alter_schluessel_tot(b, abl, a, beleg, worker):
     """P-2: nach >= 25 s an JEDEM Worker direkt; Poll einer nie vergebenen Job-ID (kein Dispatch, keine Kosten)."""
     time.sleep(a.cache_wartezeit)
-    da, key = abl.lies(INF_NAMEN["schluessel"])
+    da, key = abl.lies(abl.namen["schluessel"])
     if not da or fp8(key) != (beleg.get("schluessel") or {}).get("fp8"):
         return None
     st = {}
@@ -595,8 +611,9 @@ def main(argv=None):
     p.add_argument("--worker", action="append", default=[])
     p.add_argument("--beleg")
     p.add_argument("--nachweis")
-    for k in INF_NAMEN:
-        p.add_argument(f"--name-{k}", required=True)
+    p.add_argument("--namensfamilie", required=True)
+    for r in ROLLEN:
+        p.add_argument(f"--name-{r}")
     p.add_argument("--infisical-ws", required=True)
     p.add_argument("--infisical-env", required=True)
     p.add_argument("--infisical-pfad", required=True)
@@ -620,12 +637,16 @@ def main(argv=None):
             rc = 0 if not h else 2
         elif a.befehl == "anlegen":
             rc = anlegen(b, abl, a)
-        elif a.befehl == "pruefen":
-            rc = pruefe(b, abl, lade_beleg(a.beleg, b.url))
-        elif a.befehl == "schloss":
-            rc = schloss(b, abl, a, lade_beleg(a.beleg, b.url))
         else:
-            rc = abbauen(b, abl, a, lade_beleg(a.beleg, b.url), a.worker)
+            beleg = lade_beleg(a.beleg, b.url)
+            if beleg.get("familie") != abl.familie:
+                raise Abbruch(f"Beleg-Namensfamilie {beleg.get('familie')} != --namensfamilie {abl.familie}")
+            if a.befehl == "pruefen":
+                rc = pruefe(b, abl, beleg)
+            elif a.befehl == "schloss":
+                rc = schloss(b, abl, a, beleg)
+            else:
+                rc = abbauen(b, abl, a, beleg, a.worker)
     except Vorbedingung as e:
         zeile(f"ABBRUCH {a.befehl}: {e}")
         rc = 2
