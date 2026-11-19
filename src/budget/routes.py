@@ -529,10 +529,35 @@ async def apply_budget_deduction(
                 if entry and _is_trial_expired(entry):
                     raise BudgetDeductionDenied("trial_expired")
 
-            try:
-                result = deduct_budget(budget, effective_plan_id, actual_cost_eur)
-            except ValueError:
-                raise BudgetDeductionDenied("BUDGET_EXCEEDED")
+            # G-2 (Euro-Pruefung aus, Plan-Feld budget_enforcement exakt "off" am AKTIVEN Plan): Abbuchung
+            # ueber limit zulassen — voller Betrag auf usedEur, TopUp-Lose bleiben unberuehrt, Abrechnung normal.
+            # G-3: plans.metadata NUR lesen, wenn die Abbuchung das Limit ueberschreiten wuerde (kein plans-Read bei
+            # jedem Monatsabzug aller Apps; darunter ist deduct_budget ohnehin identisch).
+            from src.budget.strict_reservation import _euro_pruefung_aus, EURO_PRUEFUNG_AUS, STRICT_APP_ID
+            _entry = budget.monthly_budgets.get(effective_plan_id)
+            # G-4: nur der strikte Plan (Schema-Generator) kennt die Abschaltung (wie db_reserve, das nur der strikte
+            # Pfad aufruft) -> fuer alle anderen Apps nie ein plans-Read, Abbuchungspfad byte-gleich zu F.
+            _ueber = (getattr(requested_plan, "app_id", None) == STRICT_APP_ID and _entry is not None
+                      and (_entry.used_eur + actual_cost_eur) > _entry.limit_eur)
+            if _ueber and await _euro_pruefung_aus(conn, effective_plan_id):
+                from src.budget.calculator import BudgetDeductionResult
+                _neu_used = _entry.used_eur + actual_cost_eur
+                if _neu_used > _entry.limit_eur:
+                    logger.warning(
+                        "[BudgetDeduct] EURO-PRUEFUNG AUS (budget_enforcement=%s, plan=%s): Abbuchung %.6f EUR "
+                        "ueber limit %.6f gebucht (used %.6f -> %.6f), TopUp unberuehrt",
+                        EURO_PRUEFUNG_AUS, effective_plan_id, actual_cost_eur, _entry.limit_eur,
+                        _entry.used_eur, _neu_used)
+                result = BudgetDeductionResult(
+                    from_monthly=actual_cost_eur, from_top_up=0.0, new_monthly_used=_neu_used,
+                    new_top_up_lots=old_lots,
+                    new_top_up_balance_eur=topup_balance_eur(old_lots, datetime.now(timezone.utc)),
+                )
+            else:
+                try:
+                    result = deduct_budget(budget, effective_plan_id, actual_cost_eur)
+                except ValueError:
+                    raise BudgetDeductionDenied("BUDGET_EXCEEDED")
 
             # Write updated monthly usage back against effective_plan_id.
             updated_raw = dict(raw_monthly)
