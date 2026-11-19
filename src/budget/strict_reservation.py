@@ -256,7 +256,7 @@ async def settle_in_tx(conn, *, reservation_id: uuid.UUID, user_id: uuid.UUID, p
 
 # ── Worker-Seite (fail-closed) ───────────────────────────────────────────────
 
-async def db_settle_null(*, reservation_id: uuid.UUID) -> Dict[str, Any]:
+async def db_settle_null(*, reservation_id: uuid.UUID, user_id: uuid.UUID) -> Dict[str, Any]:
     """H-5 F1 (platform-api): eine OFFENE Strict-Reservierung mit 0 abrechnen (offen -> abgerechnet, settled_eur 0).
     usedEur bleibt unberuehrt. Nur Plaene der Strict-App (STRICT_APP_ID), unter derselben Zeilensperre wie Reservierung
     und Abbuchung (user_budgets FOR UPDATE). Idempotent: nicht mehr offen -> no-op (settled False).
@@ -271,6 +271,9 @@ async def db_settle_null(*, reservation_id: uuid.UUID) -> Dict[str, Any]:
                 "SELECT user_id, plan_id, status FROM budget_reservations WHERE reservation_id = $1", reservation_id)
             if r is None:
                 return {"ok": False, "reason": "reservation_unknown"}
+            if r["user_id"] != user_id:
+                # H-1 (Review e8511fe6): der Aufrufer nennt den Eigentuemer; eine fremde Reservierung bleibt unberuehrt.
+                return {"ok": False, "reason": "reservation_user_mismatch"}
             plan = get_plan(r["plan_id"])  # ValueError bei unbekanntem Plan
             if getattr(plan, "app_id", None) != STRICT_APP_ID:
                 raise ValueError(f"settle nur fuer Plaene der Strict-App (nicht {r['plan_id']})")
@@ -285,11 +288,11 @@ async def db_settle_null(*, reservation_id: uuid.UUID) -> Dict[str, Any]:
     return {"ok": True, "settled": True, "releasedEur": float(z["amount_eur"])}
 
 
-async def settle_null_via_platform(*, reservation_id: str) -> Dict[str, Any]:
+async def settle_null_via_platform(*, reservation_id: str, user_id: str) -> Dict[str, Any]:
     """Worker-Seite zu db_settle_null. Jede Antwort ausser 200/JSON wirft (die Reservierung bleibt dann offen)."""
     from src.platform_client import call_platform
 
-    resp = await call_platform("POST", "/v1/budget/strict/settle", json={"reservationId": str(reservation_id)},
+    resp = await call_platform("POST", "/v1/budget/strict/settle", json={"reservationId": str(reservation_id), "userId": str(user_id)},
                                retries=1, domain="user")
     if resp.status_code != 200 or not isinstance(resp.json, dict):
         raise RuntimeError(f"strict settle answered {resp.status_code}")
@@ -304,7 +307,7 @@ async def schliessen_ohne_anbieteraufruf(grund: str) -> None:
     if r is None or r.abgerechnet:
         return
     try:
-        await settle_null_via_platform(reservation_id=r.reservation_id)
+        await settle_null_via_platform(reservation_id=r.reservation_id, user_id=r.user_id)
         r.abgerechnet = True
         logger.warning("[StrictReserve] Reservierung %s geschlossen ohne Anbieteraufruf (%s)", r.reservation_id, grund)
     except Exception as e:  # noqa: BLE001 — fail closed: offen lassen, laut

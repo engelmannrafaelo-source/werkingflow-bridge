@@ -565,6 +565,7 @@ class VisionProvider:
             # H-5 F3: die 200 ist bezahlt — die gemessene usage der Rohantwort reist mit der Ausnahme, damit der
             # Aufrufer sie buchen kann (Status undelivered). Nicht lesbar/unvollstaendig -> None (nichts erfunden).
             fehler.usage_messung = _usage_aus_rohantwort(response)
+            fehler.provider_request_id = _request_id_aus(response)   # H-2: Beleg in der F3-Ledgerzeile
             raise fehler from exc
 
 

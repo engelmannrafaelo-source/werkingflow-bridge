@@ -4524,6 +4524,7 @@ async def _chat_completions_lauf(
                         input_tokens=_f3.eingabe, output_tokens=_f3.ausgabe,
                         cache_read_tokens=_f3.cache_lesen, cache_creation_tokens=_f3.cache_anlage,
                         status=_undelivered,
+                        abschluss_meta={"provider_request_id": getattr(direct_err, "provider_request_id", None)},
                         duration_ms=int((time.time() - start_time) * 1000),
                         error_code=type(direct_err).__name__,
                         error_message=str(direct_err)[:500],
