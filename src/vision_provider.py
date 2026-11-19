@@ -549,7 +549,23 @@ class VisionProvider:
             result.provider_request_id = _request_id_aus(response)
             return result
         except UNREADABLE_RESPONSE_ERRORS as exc:
-            raise UpstreamResponseUnreadable("anthropic", exc) from exc
+            fehler = UpstreamResponseUnreadable("anthropic", exc)
+            # H-5 F3: die 200 ist bezahlt — die gemessene usage der Rohantwort reist mit der Ausnahme, damit der
+            # Aufrufer sie buchen kann (Status undelivered). Nicht lesbar/unvollstaendig -> None (nichts erfunden).
+            fehler.usage_messung = _usage_aus_rohantwort(response)
+            raise fehler from exc
+
+
+def _usage_aus_rohantwort(response: Any) -> Optional[UsageMessung]:
+    """H-5 F3: UsageMessung aus der 200-Rohantwort, nur wenn vollstaendig (alle vier Felder int >= 0); sonst None."""
+    try:
+        daten = response.json()
+    except Exception:  # noqa: BLE001 — unlesbar: keine Messung, nichts erfinden
+        return None
+    if not isinstance(daten, dict):
+        return None
+    m = usage_messung_aus(daten.get("usage"))
+    return m if m.vollstaendig else None
 
 
 #: S-2: hoechste Gesamtfrist eines gestreamten Schema-Aufrufs (unter dem Chat-Job-Selbstaufruf 2400 s laut Compose).

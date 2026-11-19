@@ -4506,6 +4506,21 @@ async def _chat_completions_lauf(
             except Exception as direct_err:
                 # Test-KI-Deckel: nichts gemessen -> Reservierung bleibt voll stehen.
                 await _test_ki_deckel.abrechnen(None)
+                # H-5 F3 (nur Schema-Strict-Dispatch): Anbieter antwortete 200, die Antwort war unlesbar, die usage
+                # der Rohantwort ist vollstaendig gemessen -> als 'undelivered' (kostentragend) buchen. EIN Buchungsweg:
+                # der Ledger-Schreiber bucht ab und rechnet dabei die Strict-Reservierung ab (wie im Erfolgsweg).
+                _f3 = getattr(direct_err, "usage_messung", None) if _strict_dispatch else None
+                if _f3 is not None and getattr(_f3, "vollstaendig", False) is True:
+                    from src.activity.delivery import STATUS_UNDELIVERED as _undelivered
+                    await _persist_direct_usage(
+                        input_tokens=_f3.eingabe, output_tokens=_f3.ausgabe,
+                        cache_read_tokens=_f3.cache_lesen, cache_creation_tokens=_f3.cache_anlage,
+                        status=_undelivered,
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        error_code=type(direct_err).__name__,
+                        error_message=str(direct_err)[:500],
+                    )
+                    raise
                 await _persist_direct_usage(
                     input_tokens=0, output_tokens=0, status="error",
                     duration_ms=int((time.time() - start_time) * 1000),
