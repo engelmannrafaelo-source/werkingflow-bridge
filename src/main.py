@@ -6498,6 +6498,121 @@ async def _pool_luecken_rueckrunde(
     return neu, rr_usage
 
 
+async def _pool_tiefen_nachrunde(
+    *,
+    laufzeit,
+    messung,
+    soll: Dict[str, int],
+    depth: str,
+    bericht: str,
+    cli_resume_id: Optional[str],
+    workdir: Optional[Path],
+    report_file: Optional[str],
+    output_file: Optional[str],
+    sdk_mcp_servers: Optional[Dict[str, Any]],
+    append_system_prompt: Optional[str],
+    request_body: ResearchRequest,
+    backend_config: Optional[BackendConfig],
+    werkzeug_ergebnisse: List[Dict[str, Any]],
+    weitere_chunks: List[Any],
+) -> Tuple[str, Optional[Dict[str, int]], Dict[str, Any]]:
+    """ONE depth follow-up round under the quality duty (research_qualitaet, DQ-6): resume the
+    same CLI session when the measured run missed its lower bound. Ceilings count over the WHOLE
+    run (what the first round used is subtracted). Any failure keeps the report from before.
+    Returns (report, usage of the round or None, note for qualitaet.nachrunde)."""
+    from src.research_cloud.executor import RUECKRUNDE_MIN_ANTEIL
+    from src.research_cloud.prompt import search_budget_for_depth
+    from src.research_laufzeit import RUECKRUNDE_MIN_REST_S
+
+    notiz: Dict[str, Any] = {"status": "uebersprungen", "grund": None, "usage": None}
+    ceil_s, ceil_f = search_budget_for_depth(depth)
+    rest_s, rest_f = max(ceil_s - messung.suchen, 0), max(ceil_f - messung.fetches_versucht, 0)
+    if not cli_resume_id or workdir is None:
+        notiz["grund"] = f"keine fortsetzbare Sitzung (cli_session={cli_resume_id!r})"
+        return bericht, None, notiz
+    if rest_f <= 0:
+        notiz["grund"] = f"Fetch-Obergrenze des Laufs ausgeschöpft ({messung.fetches_versucht}/{ceil_f})"
+        return bericht, None, notiz
+    if laufzeit is not None and not laufzeit.reicht(RUECKRUNDE_MIN_REST_S):
+        notiz["grund"] = f"laufzeit: {laufzeit.rest():.0f} s Rest, Nachrunde braucht {RUECKRUNDE_MIN_REST_S:.0f} s"
+        return bericht, None, notiz
+    datei = Path(report_file) if report_file and Path(report_file).is_relative_to(workdir) else None
+    ziel = (f"Schreibe danach den VOLLSTÄNDIGEN ergänzten Bericht mit dem Write-Werkzeug in die Datei `{datei}` "
+            "(ganze Datei ersetzen)." if datei is not None else
+            "Gib danach den VOLLSTÄNDIGEN ergänzten Bericht als Antwort aus, nicht nur die Änderungen.")
+    auftrag = (
+        "TIEFEN-NACHRUNDE (die Bridge hat deinen Lauf gemessen): bisher "
+        f"{messung.fetches_ok} gelesene Seiten aus {messung.domains} Domains in {messung.hops} Runden. "
+        f"Mindestens nötig: {soll['fetches_ok']} gelesene Seiten aus {soll['domains']} Domains in {soll['hops']} Runden. "
+        f"Lies jetzt weitere Primärquellen mit WebFetch (höchstens {rest_f} Abrufe, höchstens {rest_s} Suchen), "
+        "bevorzugt aus Domains, die du noch nicht gelesen hast, und fasse aus dem Gelesenen mit einer weiteren Suche nach. "
+        "Gelingt das nicht, nenne den Grund unter \"Offene Lücken\". " + ziel
+    )
+    chunks: List[Dict[str, Any]] = []
+    laufzeit.beginne("tiefen_nachrunde")
+    try:
+        async for chunk in claude_cli.run_completion(
+            timeout_s=laufzeit.frist_fuer("tiefen_nachrunde"),
+            prompt=auftrag,
+            append_system_prompt=append_system_prompt,
+            model=request_body.model,
+            max_turns=min(2 * (rest_f + rest_s) + 6, 40),
+            stream=True,
+            backend_env_vars=backend_config.env_vars if backend_config else None,
+            sdk_mcp_servers=sdk_mcp_servers,
+            session_id=cli_resume_id,
+            resume_workdir=workdir,
+            disallowed_tools=(
+                list(RESEARCH_TEXT_CONTRACT_DISALLOWED_TOOLS)
+                if getattr(request_body, "antwort_im_text", False) is True else None
+            ),
+            werkzeug_ergebnisse=werkzeug_ergebnisse,
+        ):
+            chunks.append(chunk)
+            weitere_chunks.append(chunk)
+    except Exception as e:
+        laufzeit.beende("tiefen_nachrunde")
+        if datei is not None:
+            datei.write_text(bericht, encoding="utf-8")
+        usage = _rueckrunden_usage(chunks, _vorenthaltene_usage(e))
+        notiz.update(status="gescheitert", grund=f"{type(e).__name__}: {e}"[:500], usage=usage)
+        logger.error(f"research Tiefen-Nachrunde gescheitert, Bericht von vorher bleibt: {notiz['grund']}")
+        return bericht, usage, notiz
+    laufzeit.beende("tiefen_nachrunde")
+    usage = _rueckrunden_usage(chunks, None)
+    notiz["usage"] = usage
+    from src.claude_cli import lauf_abschluss
+    from src.lauf_abschluss import LaufNichtAbgeschlossen, annehmen
+    try:
+        annehmen(lauf_abschluss(chunks), ganz_fertig=True)
+    except LaufNichtAbgeschlossen as e:
+        if datei is not None:
+            datei.write_text(bericht, encoding="utf-8")
+        notiz.update(status="gescheitert", grund=f"Nachrunde nicht abgeschlossen: {e}"[:500])
+        return bericht, usage, notiz
+    if datei is not None:
+        try:
+            neu = datei.read_text(encoding="utf-8")
+        except OSError as e:
+            notiz.update(status="gescheitert", grund=f"Berichtsdatei nach der Nachrunde nicht lesbar: {e}")
+            return bericht, usage, notiz
+    else:
+        neu = _doc_agent_extract_last_assistant_text(chunks) or ""
+    if len(neu.strip()) < len(bericht.strip()) * RUECKRUNDE_MIN_ANTEIL:
+        if datei is not None:
+            datei.write_text(bericht, encoding="utf-8")
+        notiz.update(status="gescheitert", grund=(
+            f"Nachrunde lieferte keinen vollständigen Bericht ({len(neu.strip())} von vorher {len(bericht.strip())} Zeichen)"))
+        return bericht, usage, notiz
+    if output_file and datei is not None and Path(output_file) != datei:
+        try:
+            Path(output_file).write_text(neu, encoding="utf-8")
+        except OSError as e:
+            logger.error(f"research Tiefen-Nachrunde: output_file nicht aktualisiert: {e}")
+    notiz.update(status="durchgefuehrt", grund=None)
+    return neu, usage, notiz
+
+
 def _research_bibliothek_gate(library_cfg, request):
     """Library only for assigned apps (research_qualitaet.BIBLIOTHEK_APPS, Kanzler 19.11.2026).
     Returns (config to use, note for qualitaet.bibliothek). Stage 2 (relevance) stays off."""
@@ -7269,6 +7384,33 @@ async def _execute_research_impl(
                 if content_file and Path(content_file).exists():
                     file_size_bytes = Path(content_file).stat().st_size
 
+        # Depth follow-up round (research_qualitaet, DQ-6): ONLY under the quality duty, once,
+        # when the measured run missed its lower bound; ceilings count over the whole run.
+        _tiefen_notiz: Optional[Dict[str, Any]] = None
+        from src.research_qualitaet import messen as _q_messen0, untergrenzen_fuer as _q_soll0
+        _q_soll = _q_soll0(getattr(request_body, "depth", None), getattr(request_body, "qualitaet_pflicht", None) is True)
+        if _q_soll:
+            _q_vorher = _q_messen0(list(all_chunks) + list(weitere_chunks), werkzeug_ergebnisse)
+            if any(getattr(_q_vorher, k) is not None and getattr(_q_vorher, k) < v for k, v in _q_soll.items()):
+                content, _tn_usage, _tiefen_notiz = await _pool_tiefen_nachrunde(
+                    laufzeit=laufzeit, messung=_q_vorher, soll=_q_soll,
+                    depth=getattr(request_body, "depth", None) or "deep",
+                    bericht=content or "", cli_resume_id=cli_resume_id,
+                    workdir=_research_workdir(file_metadata, container_file),
+                    report_file=container_file, output_file=output_file,
+                    sdk_mcp_servers=pool_sdk_mcp_servers, append_system_prompt=library_append_prompt,
+                    request_body=request_body, backend_config=backend_config,
+                    werkzeug_ergebnisse=werkzeug_ergebnisse, weitere_chunks=weitere_chunks,
+                )
+                # Ledger: the follow-up round is part of this run's cost (own round in laufzeit/qualitaet).
+                if _tn_usage:
+                    accumulated_input_tokens = (accumulated_input_tokens or 0) + _tn_usage["input_tokens"]
+                    accumulated_output_tokens = (accumulated_output_tokens or 0) + _tn_usage["output_tokens"]
+                    accumulated_cache_read += _tn_usage["cache_read_tokens"]
+                    accumulated_cache_creation += _tn_usage["cache_creation_tokens"]
+                if content_file and Path(content_file).exists():
+                    file_size_bytes = Path(content_file).stat().st_size
+
         # Run time of the WHOLE call, every round included (BRREF-LAUFZEIT:
         # it used to stop after the main run — 282 s for a 2392 s run).
         laufzeit.beende_alle()
@@ -7353,6 +7495,7 @@ async def _execute_research_impl(
         _q_messung = _q_messen(list(all_chunks) + list(weitere_chunks), werkzeug_ergebnisse)
         _qualitaet, _q_status = _research_qualitaet_block(
             request_body, _q_messung, pfad="pool", bibliothek=_bibliothek_info)
+        _qualitaet["nachrunde"] = _tiefen_notiz
         antwort = ResearchResponse(
             status=_q_status,
             qualitaet=_qualitaet,
