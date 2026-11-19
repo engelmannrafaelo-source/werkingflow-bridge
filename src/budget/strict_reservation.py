@@ -256,6 +256,25 @@ async def settle_in_tx(conn, *, reservation_id: uuid.UUID, user_id: uuid.UUID, p
 
 # ── Worker-Seite (fail-closed) ───────────────────────────────────────────────
 
+#: H-5 F2 R3-Kostenvertrag (Root 01a1f43b, 19.11.2026): Eine Strict-Reservierung wird NUR geschlossen, wenn die
+#: Kostenfrage entschieden ist — F1 kein Anbieter-Request begonnen (0, gemessen), F3 Anbieter-200 mit vollstaendiger
+#: usage (Ist-Betrag). Ein Anbieter-4xx gilt nur dann als 0, wenn KOSTENBELEGE[(anbieter, status)] einen woertlichen
+#: Vertragsbeleg (url, stand, zitat) traegt ("vertraglich angenommen", nie "gemessen"); ohne Eintrag cost_status
+#: "unbekannt" (= unbelegt, bestehender Ledger-Wert) + request_id im Ledger, Reservierung bleibt offen (Ueberblockung, nie Ueberziehung). Alles andere
+#: (Timeout, 5xx, 529, 429, Stream-Abbruch, LB-/Proxy-Antworten, mehr als ein Versuch) bleibt offen. Ein Fehlerende
+#: wiederholt den Aufruf deswegen nie. Recherche 19.11.2026 (VORSCHLAG-H5-F2-R3-VERTRAG): kein Anbieterbeleg -> leer.
+KOSTENBELEGE: Dict[Any, Dict[str, str]] = {}
+
+
+def _kostenbelege_pruefen() -> None:
+    for k, v in KOSTENBELEGE.items():
+        if not (isinstance(v, dict) and all(isinstance(v.get(f), str) and v.get(f) for f in ("url", "stand", "zitat"))):
+            raise RuntimeError(f"KOSTENBELEGE[{k!r}] ohne url/stand/zitat")
+
+
+_kostenbelege_pruefen()
+
+
 async def db_settle_null(*, reservation_id: uuid.UUID, user_id: uuid.UUID) -> Dict[str, Any]:
     """H-5 F1 (platform-api): eine OFFENE Strict-Reservierung mit 0 abrechnen (offen -> abgerechnet, settled_eur 0).
     usedEur bleibt unberuehrt. Nur Plaene der Strict-App (STRICT_APP_ID), unter derselben Zeilensperre wie Reservierung

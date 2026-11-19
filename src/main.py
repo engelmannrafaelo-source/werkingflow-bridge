@@ -4530,11 +4530,19 @@ async def _chat_completions_lauf(
                         error_message=str(direct_err)[:500],
                     )
                     raise
+                # H-5 F2: Anbieter-4xx im Schema-Weg -> cost_status "unbekannt" (= unbelegt, bestehender Ledger-Wert) + request_id sichtbar (KOSTENBELEGE leer:
+                # nichts wird geschlossen, Reservierung bleibt nach R3 offen, keine Wiederholung).
+                _f2 = None
+                if _strict_dispatch and getattr(direct_err, "anbieter_status", None) is not None:
+                    _f2 = {"cost_status": "unbekannt", "anbieter": getattr(direct_err, "anbieter", None),
+                           "anbieter_status": getattr(direct_err, "anbieter_status", None),
+                           "provider_request_id": getattr(direct_err, "provider_request_id", None)}
                 await _persist_direct_usage(
                     input_tokens=0, output_tokens=0, status="error",
                     duration_ms=int((time.time() - start_time) * 1000),
                     error_code=type(direct_err).__name__,
                     error_message=str(direct_err)[:500],
+                    **({"abschluss_meta": _f2} if _f2 else {}),
                 )
                 raise
             duration = time.time() - start_time

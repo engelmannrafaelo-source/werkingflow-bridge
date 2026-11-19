@@ -539,10 +539,15 @@ class VisionProvider:
                 }
             )
             if 400 <= response.status_code < 500 and response.status_code != 429:
-                raise HTTPException(
+                fehler4 = HTTPException(
                     status_code=response.status_code,
                     detail=error_body[:1000]
                 )
+                # H-5 F2: Kennzeichnung NUR aus der echten Anbieterantwort (LB-/Proxy-/Bridge-4xx laufen hier nie durch).
+                fehler4.anbieter = "anthropic"
+                fehler4.anbieter_status = response.status_code
+                fehler4.provider_request_id = _request_id_aus(response)
+                raise fehler4
             raise RuntimeError(
                 f"Anthropic API error ({response.status_code}): {error_body[:200]}"
             )
