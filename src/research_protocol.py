@@ -15,7 +15,7 @@ categories dropped — declared honestly by the agent, caught loudly by nobody.
 from __future__ import annotations
 
 import re
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from src.research_cloud.prompt import search_budget_for_depth
 
@@ -60,6 +60,7 @@ def build_research_execution_prompt(
     max_turns: int,
     library_dir: Optional[str] = None,
     antwort_im_text: bool = False,
+    untergrenzen: Optional[Dict[str, int]] = None,
 ) -> Tuple[str, int, str]:
     """Transform a ``/sc:research "…" --flags`` prompt into the direct
     execution protocol, honouring the requested depth.
@@ -107,10 +108,10 @@ def build_research_execution_prompt(
 
     if library_dir:
         return (
-            _library_first_protocol(
+            _mit_untergrenzen(_library_first_protocol(
                 research_query, depth, search_budget, fetch_budget, library_dir,
                 antwort_im_text=antwort_im_text,
-            ),
+            ), depth, untergrenzen),
             effective_turns,
             depth,
         )
@@ -147,7 +148,30 @@ OUTPUT STRUCTURE:
 
 {closing}
 """
-    return execution_prompt, effective_turns, depth
+    return _mit_untergrenzen(execution_prompt, depth, untergrenzen), effective_turns, depth
+
+
+#: Header of both protocols without a quality duty (byte-identical snapshot).
+_KOPF_OBERGRENZEN = "— budgets are ceilings, not targets):"
+
+
+def _mit_untergrenzen(protokoll: str, depth: str, untergrenzen: Optional[Dict[str, int]]) -> str:
+    """Quality duty (research_qualitaet, Kanzler 19.11.2026, only with qualitaet_pflicht):
+    the ceilings stay, a MINIMUM joins them. Without bounds the text is returned unchanged."""
+    if not untergrenzen:
+        return protokoll
+    if protokoll.count(_KOPF_OBERGRENZEN) != 1:
+        raise ValueError("research protocol header changed — quality bounds cannot be placed")
+    f, d, h = untergrenzen["fetches_ok"], untergrenzen["domains"], untergrenzen["hops"]
+    pflicht = (
+        "— budgets are ceilings; the MINIMUM below is binding):\n"
+        f"0. MINIMUM before you write: read at least {f} pages with WebFetch (real pages with content, "
+        f"not error, redirect or empty pages), from at least {d} different domains, in at least {h} rounds "
+        "— after reading, follow up with at least one further search that comes from what you read. "
+        "If you cannot reach this minimum, say so under \"Offene Lücken\" with the reason; the bridge "
+        "measures it from your tool calls."
+    )
+    return protokoll.replace(_KOPF_OBERGRENZEN, pflicht, 1)
 
 
 def _library_first_protocol(

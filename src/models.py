@@ -663,6 +663,19 @@ class ResearchRequest(BaseModel):
     # Under the file contract such a caller is overruled by the bridge's own
     # "write the report into OUTPUT_FILE_PATH" order, and got back whatever
     # file the run touched first (a Python script, a 926-char summary).
+    # Quality duty (research_qualitaet, Kanzler 19.11.2026, variant B): opt-in.
+    # True = deep/exhaustive bind a MINIMUM (read pages, domains, rounds) in the
+    # prompt, and a missed or unmeasurable minimum answers status 'teilweise'
+    # instead of 'success'. None/False = unchanged behaviour (Energy until its
+    # own decision); the response carries the qualitaet block either way.
+    qualitaet_pflicht: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Opt-in quality duty for depth deep/exhaustive: lower bounds on read pages, "
+            "domains and rounds bind the run; missed or unmeasurable -> status 'teilweise' "
+            "with qualitaet.grund. Default: no duty (status as before, qualitaet block only)."
+        ),
+    )
     antwort_im_text: Optional[bool] = Field(
         default=False,
         description=(
@@ -774,7 +787,7 @@ class ResearchResponse(ErrorVerdictFields):
     """
     # src/providers/funding_policy.py: which funding served this run.
     funding_policy: Optional[Literal["promotional_only", "subscription_staging_fallback"]] = None
-    status: Literal["success", "error"]
+    status: Literal["success", "error", "teilweise"]
     query: str
     model: str
     output_file: Optional[str] = Field(
@@ -903,6 +916,15 @@ class ResearchResponse(ErrorVerdictFields):
             "depth|promotional|pool_cap per limit; pool_cap = web_search capped per request "
             "round at the credit-pool limit of 3), pfad (pool|cloud), nicht_durchsetzbar (limits this path cannot "
             "enforce). On vertrag_version_abweichend: the current server contract."
+        ),
+    )
+    qualitaet: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Measured research quality (research_qualitaet): erreicht {suchen, fetches_versucht, "
+            "fetches_ok, quellen_gelesen, domains, hops} from the run's tool calls, soll (lower "
+            "bounds of deep/exhaustive), status nicht_anwendbar|erfuellt|teilweise|unbekannt, grund, "
+            "pflicht, pfad, bibliothek. Unknown values are null with a reason, never 0."
         ),
     )
     nachkontrolle: Optional[Dict[str, Any]] = Field(

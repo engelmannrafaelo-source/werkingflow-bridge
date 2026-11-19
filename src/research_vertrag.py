@@ -598,6 +598,20 @@ def beschreibung() -> Dict[str, Any]:
             "max_turns ist nie eine Forderung"
         ),
         "zeitkette": {"gesamtfrist_s": _rl.GESAMTFRIST_S},
+        # Lower bounds (research_qualitaet): deliberately OUTSIDE version() — neither
+        # in grenzen nor capabilities —, so a pinned contract version stays valid.
+        "untergrenzen": _untergrenzen_beschreibung(),
+    }
+
+
+def _untergrenzen_beschreibung() -> Dict[str, Any]:
+    from src.research_qualitaet import UNTERGRENZEN
+    return {
+        "werte": {k: dict(v) for k, v in UNTERGRENZEN.items()},
+        "opt_in": "qualitaet_pflicht=true",
+        "regel": ("nur mit qualitaet_pflicht binden Untergrenzen den Lauf; verfehlt oder nicht messbar "
+                  "-> status 'teilweise' mit qualitaet.grund; ohne Opt-in nur der Block qualitaet"),
+        "im_versions_hash": False,
     }
 
 

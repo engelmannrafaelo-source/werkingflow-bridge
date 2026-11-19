@@ -2118,6 +2118,8 @@ class ClaudeCodeCLI:
         antwort_im_text: bool = False,
         timeout_s: Optional[float] = None,
         cli_tools: Optional[List[str]] = None,
+        werkzeug_ergebnisse: Optional[List[Dict[str, Any]]] = None,
+        research_untergrenzen: Optional[Dict[str, int]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Code using the Python SDK and yield response chunks.
 
@@ -2248,6 +2250,7 @@ class ClaudeCodeCLI:
             prompt, max_turns, research_depth = build_research_execution_prompt(
                 prompt, max_turns, library_dir=research_library_dir,
                 antwort_im_text=antwort_im_text,
+                untergrenzen=research_untergrenzen,
             )
             logger.info(
                 f"   Research depth: {research_depth}, max_turns: {max_turns}, "
@@ -2947,6 +2950,13 @@ class ClaudeCodeCLI:
                             # every consumer reads {"content": [...]} as
                             # assistant text. Still counted + in messages.jsonl.
                             if is_user_turn(message):
+                                if werkzeug_ergebnisse is not None:
+                                    # Research quality (DQ-1/DQ-3): the caller's OWN list for
+                                    # THIS run gets one verdict per ToolResult (id, is_error,
+                                    # read-signal) — the content is judged and dropped here,
+                                    # the turn itself is still withheld below.
+                                    from src.research_qualitaet import ergebnisse_aus_turn
+                                    werkzeug_ergebnisse.extend(ergebnisse_aus_turn(message))
                                 if CLI_SAFETY_STOP_SENTENCE in _message_text(message):
                                     # BRREF: the CLI re-prompts the model once
                                     # after a classifier stop; the next

@@ -6342,6 +6342,8 @@ async def _pool_luecken_rueckrunde(
     append_system_prompt: Optional[str],
     request_body: ResearchRequest,
     backend_config: Optional[BackendConfig],
+    werkzeug_ergebnisse: Optional[List[Dict[str, Any]]] = None,
+    weitere_chunks: Optional[List[Any]] = None,
 ) -> Tuple[str, Optional[Dict[str, int]]]:
     """The ONE return round on the pool path: resume the same CLI session in its
     own directory, with the same tool instances (budgets continue), and take the
@@ -6410,8 +6412,11 @@ async def _pool_luecken_rueckrunde(
                 list(RESEARCH_TEXT_CONTRACT_DISALLOWED_TOOLS)
                 if getattr(request_body, "antwort_im_text", False) is True else None
             ),
+            werkzeug_ergebnisse=werkzeug_ergebnisse,
         ):
             chunks.append(chunk)
+            if weitere_chunks is not None:
+                weitere_chunks.append(chunk)
     except Exception as e:
         if laufzeit is not None:
             laufzeit.beende("rueckrunde")
@@ -6491,6 +6496,32 @@ async def _pool_luecken_rueckrunde(
         with (laufzeit.messen("nachmessung") if laufzeit is not None else nullcontext()):
             await nachkontrolle.nachmessen(neu, protokoll_aus_pool_chunks(list(erste_chunks) + chunks))
     return neu, rr_usage
+
+
+def _research_bibliothek_gate(library_cfg, request):
+    """Library only for assigned apps (research_qualitaet.BIBLIOTHEK_APPS, Kanzler 19.11.2026).
+    Returns (config to use, note for qualitaet.bibliothek). Stage 2 (relevance) stays off."""
+    from src.research_qualitaet import bibliothek_fuer_app
+    from src.routing.app_provider_policy import _resolve_app_id
+    app_id = _resolve_app_id(request)[0] if request is not None else None
+    if not library_cfg.enabled:
+        return library_cfg, {"genutzt": False, "grund": "bibliothek_aus", "app": app_id}
+    if bibliothek_fuer_app(app_id):
+        return library_cfg, {"genutzt": True, "grund": None, "app": app_id}
+    logger.info(f"research: Bibliothek übersprungen — App {app_id!r} ist ihr nicht zugeordnet")
+    return library_cfg.model_copy(update={"enabled": False}), {
+        "genutzt": False, "grund": "app_nicht_zugeordnet", "app": app_id}
+
+
+def _research_qualitaet_block(request_body, messung, *, pfad: str, bibliothek: Optional[Dict[str, Any]]):
+    """(qualitaet block, top-level status) for a run that produced a report."""
+    from src.research_qualitaet import bewerten, top_status
+    pflicht = getattr(request_body, "qualitaet_pflicht", None) is True
+    q = bewerten(messung, getattr(request_body, "depth", None), pflicht=pflicht, pfad=pfad)
+    q["bibliothek"] = bibliothek
+    if q["status"] in ("teilweise", "unbekannt"):
+        logger.warning(f"research qualitaet {q['status']} (pflicht={pflicht}, pfad={pfad}): {q['grund']}")
+    return q, top_status(q)
 
 
 def _research_usage_felder(
@@ -6649,8 +6680,9 @@ async def _execute_research_impl(
         library_append_prompt: Optional[str] = None
         library_seed_links: Optional[Dict[str, Dict[str, str]]] = None
         library_active = False
+        _bibliothek_info: Optional[Dict[str, Any]] = None
         try:
-            _library_cfg = load_library_config()
+            _library_cfg, _bibliothek_info = _research_bibliothek_gate(load_library_config(), request)
             _library_index = await load_library_for_run(_library_cfg)
             if _library_index is not None:
                 _mirror = await sync_library_mirror(_library_cfg, _library_index)
@@ -6773,6 +6805,10 @@ async def _execute_research_impl(
         all_chunks = []
         file_metadata = None
         cli_resume_id: Optional[str] = None
+        # Research quality (research_qualitaet): ToolResult verdicts of THIS run only (DQ-3).
+        from src.research_qualitaet import untergrenzen_fuer
+        werkzeug_ergebnisse: List[Dict[str, Any]] = []
+        weitere_chunks: List[Any] = []
 
         research_lauf_gestartet = True
         laufzeit.beginne("hauptlauf")
@@ -6790,6 +6826,11 @@ async def _execute_research_impl(
             backend_env_vars=backend_config.env_vars if backend_config else None,
             seed_links=library_seed_links,
             sdk_mcp_servers=pool_sdk_mcp_servers,
+            werkzeug_ergebnisse=werkzeug_ergebnisse,
+            research_untergrenzen=untergrenzen_fuer(
+                getattr(request_body, "depth", None),
+                getattr(request_body, "qualitaet_pflicht", None) is True,
+            ),
         ), antwort_im_text):
             all_chunks.append(chunk)
             if "session_id" in chunk:
@@ -7212,6 +7253,8 @@ async def _execute_research_impl(
                     append_system_prompt=library_append_prompt,
                     request_body=request_body,
                     backend_config=backend_config,
+                    werkzeug_ergebnisse=werkzeug_ergebnisse,
+                    weitere_chunks=weitere_chunks,
                 )
                 # Ledger: the return round is part of this run's cost.
                 if rr_usage:
@@ -7306,8 +7349,15 @@ async def _execute_research_impl(
         except Exception as _track_err:
             logger.warning(f"⚠️ research activity tracking failed (non-fatal): {_track_err}")
 
+        from src.research_qualitaet import messen as _q_messen
+        _q_messung = _q_messen(list(all_chunks) + list(weitere_chunks), werkzeug_ergebnisse)
+        _qualitaet, _q_status = _research_qualitaet_block(
+            request_body, _q_messung, pfad="pool", bibliothek=_bibliothek_info)
         antwort = ResearchResponse(
-            status="success",
+            status=_q_status,
+            qualitaet=_qualitaet,
+            web_searches=_q_messung.suchen,
+            web_fetches=_q_messung.fetches_versucht,
             query=request_body.query,
             model=request_body.model,
             output_file=output_file,
@@ -7554,7 +7604,7 @@ async def _execute_research_cloud_impl(
     except Exception as _oa_err:
         logger.warning(f"research-cloud: OA-Scholarly-Schicht übersprungen (fail-soft): {_oa_err}")
 
-    library_cfg = load_library_config()
+    library_cfg, _bibliothek_info = _research_bibliothek_gate(load_library_config(), request)
     # Resolve the library BEFORE the first token is spent: this both loads the
     # catalogue that goes into the system prompt and is the one moment where a
     # library that is switched on but broken can still fail cheaply and loudly.
@@ -7862,8 +7912,19 @@ async def _execute_research_cloud_impl(
         except OSError as e:
             logger.warning(f"research-cloud: could not write output_path {request_body.output_path!r}: {e}")
 
+    # Research quality on the cloud path: attempts from the executor's counters; read
+    # verdicts, domains and rounds are not measured here -> unknown, never a pass (DQ-5).
+    from src.research_qualitaet import Messung as _QMessung
+    _q_messung = _QMessung(
+        suchen=int(result.searches or 0), fetches_versucht=int(result.fetches or 0),
+        fetches_ok=None, quellen_gelesen=None, domains=None, hops=None,
+        gruende_unbekannt=["Cloud-Weg liefert keine Leseurteile je Abruf"],
+    )
+    _qualitaet, _q_status = _research_qualitaet_block(
+        request_body, _q_messung, pfad="cloud", bibliothek=_bibliothek_info)
     return ResearchResponse(
-        status="success",
+        status=_q_status,
+        qualitaet=_qualitaet,
         query=request_body.query,
         model=result.model,
         output_file=output_file,
@@ -8266,7 +8327,8 @@ async def _run_async_research_job(
             ))
         result = _research_antwort_mit_vertrag(result, request, request_body)
         _save_research_job(job_id, {
-            "status": "done" if result.status == "success" else "error",
+            # 'teilweise' (quality duty, research_qualitaet) is a finished run with a report.
+            "status": "error" if result.status == "error" else "done",
             "started_at": started_at,
             "finished_at": time.time(),
             "result": result.model_dump(),
