@@ -456,24 +456,29 @@ def pruefe(b, abl, beleg):
     return 0 if alles else 1
 
 
+def probe_koepfe(key, uid):
+    """Einreichung und Poll tragen DIESELBEN Koepfe: der Job-Owner ist Digest(Principal, App, User)
+    (jobs/routes.py _idempotency_owner/_visible_to_caller); ohne X-User-ID im Poll antwortet die Bridge 404."""
+    return {"Authorization": "Bearer " + key, "X-App-ID": APP, "X-User-ID": uid,
+            "X-Workflow-ID": NAME, "X-Agent-ID": "schloss-probe"}
+
+
 def job_probe(b, key, uid):
     """Ein synthetischer Minimal-Chat-Job ueber den LB (einziger Chatweg des Principals): POST /v1/jobs mit
     Idempotency-Key (LB-Pflicht fuer Schema). Liefert (status_einreichung, antwort, roh)."""
     body = {"kind": "chat", "payload": {"model": MODELL, "max_tokens": 1,
                                         "messages": [{"role": "user", "content": "schloss-probe"}]}}
     return b.req("POST", "/v1/jobs", body, operator=False,
-                 kopf={"Authorization": "Bearer " + key, "X-App-ID": APP, "X-User-ID": uid,
-                       "X-Workflow-ID": NAME, "X-Agent-ID": "schloss-probe",
-                       "Idempotency-Key": "schloss-probe-" + secrets.token_hex(16)})
+                 kopf={**probe_koepfe(key, uid), "Idempotency-Key": "schloss-probe-" + secrets.token_hex(16)})
 
 
-def job_ende(b, key, job_id):
+def job_ende(b, key, uid, job_id):
     """Pollt GET /v1/jobs/<id> bis zum Endzustand; (status, error-JSON als Text)."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(job_id or "")):
         raise Abbruch("Job-ID der Einreichung ungueltig")
     for _ in range(POLL_MAX):
         st, j, _ = b.req("GET", f"/v1/jobs/{job_id}", operator=False,
-                         kopf={"Authorization": "Bearer " + key, "X-App-ID": APP})
+                         kopf=probe_koepfe(key, uid))
         if st != 200 or not isinstance(j, dict):
             raise Abbruch(f"GET /v1/jobs/<id>: {st}")
         if j.get("status") in ("done", "error", "cancelled"):
@@ -512,7 +517,7 @@ def schloss(b, abl, a, beleg):
     st, j, _ = job_probe(b, key, uid)
     if st not in (200, 201) or not isinstance(j, dict):
         raise Abbruch(f"POST /v1/jobs (Probejob): {st}")
-    ende, fehler = job_ende(b, key, j.get("job_id"))
+    ende, fehler = job_ende(b, key, uid, j.get("job_id"))
     nach = spuren(a, uid)
     # Die Schloesser greifen im Job-Selbstaufruf vor jeder Reservierung/jedem Dispatch (main.py ~3940 vor 4097).
     zu = ende == "error" and any(c in fehler for c in NONEU_CODES)
