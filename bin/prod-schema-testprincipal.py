@@ -55,9 +55,12 @@ EMAIL = NAME + "@test.werkingflow.com"
 APP, PLAN = "werking-schema-generator", "schema-generator"
 PIN = {"provider": "anthropic_direct"}
 MODELL = "claude-sonnet-5-5"
-# P-1: genau die Schema-Wege der LB-Weiche. Homepage 3877e68 (ki.ts) ruft nur /v1/chat/completions; kein
-# /v1/auth/account-exists. "/v1/jobs/*" erlaubt per _segment_match genau EIN Segment (Poll), nie Tiefe.
-ALLOWED_PATHS = ("/v1/chat/completions", "/v1/jobs", "/v1/jobs/*", "/v1/privacy/image-mask", "/v1/privacy/image-receipt")
+# P-1 (Kanzler 19.11. nach Code-Analyse c041 4df72753cdbe): Homepage 552766d5 ruft direkt nur POST /v1/jobs,
+# GET /v1/jobs/<id>, POST /v1/privacy/image-mask|image-receipt. Chat und smart-anonymize laufen nur im Job-Selbstaufruf
+# (Worker-Schluessel), daher NICHT freigegeben. "/v1/jobs/*" = per _segment_match genau EIN Segment (Poll).
+# Hinweis: wsg_-Schluessel duerfen am 8bcf742 nur /v1/jobs* (auth.py:560-565); Bildrouten erst mit Folge-Fix (c041).
+ALLOWED_PATHS = ("/v1/jobs", "/v1/jobs/*", "/v1/privacy/image-mask", "/v1/privacy/image-receipt")
+POLL_S, POLL_MAX = 2, 60
 # Rafaels persoenliche Prod-IDs (BEFUND-RAFAEL-PROD-USERID): nie anfassen, nie gleich der Test-UUID.
 RAFAEL_IDS = frozenset({"c51392fb-0956-4a00-a052-d395ef411e1a", "dbde0f89-bad5-4d3b-b3a5-b21427e8dd03",
                         "be44fb61-5607-4a35-8726-70297a8f07d4", "53c3d016-0c2e-4c84-b49a-092204de44ad"})
@@ -215,7 +218,10 @@ class Bridge:
 
     def deaktivieren(self, grund):
         """set-active false mit Readback; ohne Beleg rc 7."""
-        st, j, _ = self.req("POST", "/v1/admin/service-principals/set-active", {"name": NAME, "active": False})
+        try:  # A-W-3 (R2): auch ein Verbindungsfehler hier endet in rc 7 mit SOFORT-Zeile
+            st, j, _ = self.req("POST", "/v1/admin/service-principals/set-active", {"name": NAME, "active": False})
+        except Abbruch:
+            st = None
         try:
             ist = [p.get("active") for p in self.principals()]
         except Abbruch:
@@ -450,12 +456,30 @@ def pruefe(b, abl, beleg):
     return 0 if alles else 1
 
 
-def chat_probe(b, key, uid):
-    """Ein synthetischer Minimalaufruf ueber den LB (P-3 Festlegung): bei geschlossenen Schloessern 403 vor Dispatch."""
-    body = {"model": MODELL, "max_tokens": 1, "messages": [{"role": "user", "content": "schloss-probe"}]}
-    return b.req("POST", "/v1/chat/completions", body, operator=False,
+def job_probe(b, key, uid):
+    """Ein synthetischer Minimal-Chat-Job ueber den LB (einziger Chatweg des Principals): POST /v1/jobs mit
+    Idempotency-Key (LB-Pflicht fuer Schema). Liefert (status_einreichung, antwort, roh)."""
+    body = {"kind": "chat", "payload": {"model": MODELL, "max_tokens": 1,
+                                        "messages": [{"role": "user", "content": "schloss-probe"}]}}
+    return b.req("POST", "/v1/jobs", body, operator=False,
                  kopf={"Authorization": "Bearer " + key, "X-App-ID": APP, "X-User-ID": uid,
-                       "X-Workflow-ID": NAME, "X-Agent-ID": "schloss-probe"})
+                       "X-Workflow-ID": NAME, "X-Agent-ID": "schloss-probe",
+                       "Idempotency-Key": "schloss-probe-" + secrets.token_hex(16)})
+
+
+def job_ende(b, key, job_id):
+    """Pollt GET /v1/jobs/<id> bis zum Endzustand; (status, error-JSON als Text)."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(job_id or "")):
+        raise Abbruch("Job-ID der Einreichung ungueltig")
+    for _ in range(POLL_MAX):
+        st, j, _ = b.req("GET", f"/v1/jobs/{job_id}", operator=False,
+                         kopf={"Authorization": "Bearer " + key, "X-App-ID": APP})
+        if st != 200 or not isinstance(j, dict):
+            raise Abbruch(f"GET /v1/jobs/<id>: {st}")
+        if j.get("status") in ("done", "error", "cancelled"):
+            return j.get("status"), json.dumps(j.get("error"))
+        time.sleep(POLL_S)
+    raise Abbruch("Probejob nicht in Endzustand — Ergebnis unbelegt")
 
 
 def spuren(a, uid):
@@ -485,14 +509,20 @@ def schloss(b, abl, a, beleg):
     if not da or fp8(key) != (beleg.get("schluessel") or {}).get("fp8"):
         raise Abbruch("Schluessel in Infisical fehlt oder Fingerabdruck != Anlagebeleg")
     vor = spuren(a, uid)
-    st, _, roh = chat_probe(b, key, uid)
+    st, j, _ = job_probe(b, key, uid)
+    if st not in (200, 201) or not isinstance(j, dict):
+        raise Abbruch(f"POST /v1/jobs (Probejob): {st}")
+    ende, fehler = job_ende(b, key, j.get("job_id"))
     nach = spuren(a, uid)
-    zu = st == 403 and any(c in roh for c in NONEU_CODES)
-    still = vor == nach
-    zeile(f"{'PASS' if zu else 'FAIL'} N-B Schloesser zu: status={st} noneu_code={any(c in roh for c in NONEU_CODES)}")
-    zeile(f"{'PASS' if still else 'FAIL'} N-B ohne Spuren: vorher={vor} nachher={nach}")
+    # Die Schloesser greifen im Job-Selbstaufruf vor jeder Reservierung/jedem Dispatch (main.py ~3940 vor 4097).
+    zu = ende == "error" and any(c in fehler for c in NONEU_CODES)
+    # P-3 im Jobweg: Ledger und Reservierungen +0; ai_jobs genau +1 (der Probejob selbst).
+    still = (nach["ledger"] == vor["ledger"] and nach["reservierungen"] == vor["reservierungen"]
+             and nach["usage"] == vor["usage"] + 1)
+    zeile(f"{'PASS' if zu else 'FAIL'} N-B Schloesser zu: job={ende} noneu_code={any(c in fehler for c in NONEU_CODES)}")
+    zeile(f"{'PASS' if still else 'FAIL'} N-B ohne Spuren (ledger/reservierungen +0, ai_jobs +1): vorher={vor} nachher={nach}")
     zufall = "wsg_" + secrets.token_hex(32)
-    st2, _, _ = chat_probe(b, zufall, uid)
+    st2, _, _ = job_probe(b, zufall, uid)
     zeile(f"{'PASS' if st2 == 401 else 'FAIL'} N-D Zufallsschluessel wsg_: status={st2}")
     del key, zufall
     return 0 if (zu and still and st2 == 401) else 1
