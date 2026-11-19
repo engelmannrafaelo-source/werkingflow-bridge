@@ -256,6 +256,62 @@ async def settle_in_tx(conn, *, reservation_id: uuid.UUID, user_id: uuid.UUID, p
 
 # ── Worker-Seite (fail-closed) ───────────────────────────────────────────────
 
+async def db_settle_null(*, reservation_id: uuid.UUID) -> Dict[str, Any]:
+    """H-5 F1 (platform-api): eine OFFENE Strict-Reservierung mit 0 abrechnen (offen -> abgerechnet, settled_eur 0).
+    usedEur bleibt unberuehrt. Nur Plaene der Strict-App (STRICT_APP_ID), unter derselben Zeilensperre wie Reservierung
+    und Abbuchung (user_budgets FOR UPDATE). Idempotent: nicht mehr offen -> no-op (settled False).
+    Unbekannte reservation_id -> {"ok": False, "reason": "reservation_unknown"}; fremder Plan -> ValueError."""
+    from src.budget.plans import get_plan
+    from src.db.client import get_pool
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            r = await conn.fetchrow(
+                "SELECT user_id, plan_id, status FROM budget_reservations WHERE reservation_id = $1", reservation_id)
+            if r is None:
+                return {"ok": False, "reason": "reservation_unknown"}
+            plan = get_plan(r["plan_id"])  # ValueError bei unbekanntem Plan
+            if getattr(plan, "app_id", None) != STRICT_APP_ID:
+                raise ValueError(f"settle nur fuer Plaene der Strict-App (nicht {r['plan_id']})")
+            await conn.fetchrow("SELECT 1 FROM user_budgets WHERE user_id = $1 FOR UPDATE", r["user_id"])
+            z = await conn.fetchrow(
+                "UPDATE budget_reservations SET status = 'abgerechnet', settled_eur = 0, closed_at = now() "
+                "WHERE reservation_id = $1 AND status = 'offen' RETURNING amount_eur", reservation_id)
+    if z is None:
+        return {"ok": True, "settled": False, "status": r["status"]}
+    logger.warning("[StrictReserve] Reservierung %s (plan=%s, %.6f EUR) mit 0 abgerechnet: kein Anbieter-Request "
+                   "begonnen (H-5 F1)", reservation_id, r["plan_id"], float(z["amount_eur"]))
+    return {"ok": True, "settled": True, "releasedEur": float(z["amount_eur"])}
+
+
+async def settle_null_via_platform(*, reservation_id: str) -> Dict[str, Any]:
+    """Worker-Seite zu db_settle_null. Jede Antwort ausser 200/JSON wirft (die Reservierung bleibt dann offen)."""
+    from src.platform_client import call_platform
+
+    resp = await call_platform("POST", "/v1/budget/strict/settle", json={"reservationId": str(reservation_id)},
+                               retries=1, domain="user")
+    if resp.status_code != 200 or not isinstance(resp.json, dict):
+        raise RuntimeError(f"strict settle answered {resp.status_code}")
+    return resp.json
+
+
+async def schliessen_ohne_anbieteraufruf(grund: str) -> None:
+    """H-5 F1 (Worker, Fehlerzweig des Schema-Direktwegs): die Reservierung DIESES Aufrufs mit 0 schliessen.
+    Nur aufrufen, wenn die positive Marke "kein Anbieter-Request begonnen" gesetzt ist. Fehler -> laut, Reservierung
+    bleibt offen (R3: Ueberblockung, nie Ueberziehung)."""
+    r = current.get()
+    if r is None or r.abgerechnet:
+        return
+    try:
+        await settle_null_via_platform(reservation_id=r.reservation_id)
+        r.abgerechnet = True
+        logger.warning("[StrictReserve] Reservierung %s geschlossen ohne Anbieteraufruf (%s)", r.reservation_id, grund)
+    except Exception as e:  # noqa: BLE001 — fail closed: offen lassen, laut
+        logger.error("[StrictReserve] Reservierung %s bleibt offen: Abschluss mit 0 fehlgeschlagen (%s: %s)",
+                     r.reservation_id, type(e).__name__, e)
+
+
 async def reserve_via_platform(*, user_id: uuid.UUID, plan_id: str, amount_eur: float) -> Dict[str, Any]:
     """Eine Wiederholung (idempotent per ID). Jede Antwort ausser 200/JSON wirft."""
     from src.platform_client import call_platform

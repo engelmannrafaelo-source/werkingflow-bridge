@@ -21,6 +21,15 @@ from config.logging_config import get_logger
 from src.model_request import adapt_model_request
 from src.model_registry import get_default_model, model_supports_temperature
 from src.providers import credit_pool
+from contextvars import ContextVar
+
+#: H-5 F1: positive Marke, ob fuer diesen Aufruf schon ein Anbieter-Request (Messages API) begonnen wurde.
+#: Gesetzt auf ANFRAGE_NICHT_BEGONNEN nur vom Schema-Strict-Dispatch in main.py direkt vor dem Aufruf; analyze()
+#: setzt ANFRAGE_BEGONNEN unmittelbar VOR jedem Versand. Nur der exakte Wert ANFRAGE_NICHT_BEGONNEN erlaubt dem
+#: Aufrufer, die Strict-Reservierung mit 0 zu schliessen; None/unbekannt/begonnen -> Reservierung bleibt (R3).
+ANFRAGE_NICHT_BEGONNEN = "nicht_begonnen"
+ANFRAGE_BEGONNEN = "begonnen"
+ANBIETER_ANFRAGE: ContextVar[Optional[str]] = ContextVar("anbieter_anfrage", default=None)
 
 logger = get_logger(__name__)
 
@@ -406,6 +415,7 @@ class VisionProvider:
                 "abo_bildweg" if subscription_fallback else "pool_aus",
             )
         if subscription_fallback:
+            ANBIETER_ANFRAGE.set(ANFRAGE_BEGONNEN)  # H-5 F1: ab hier kann ein Anbieter-Request laufen
             # Abo-Bildweg vor jedem anderen Zweig: kein Pool-Nachversuch, kein
             # bezahlter Schlüssel. Die Prüfung der Kennung wiederholt das Modul.
             from src.providers.subscription_vision import analyze_via_subscription
@@ -479,6 +489,8 @@ class VisionProvider:
 
         adapt_model_request(model, request_body)
 
+        # H-5 F1: ab hier (Pool, Fallback, Stream, POST) kann ein Anbieter-Request laufen.
+        ANBIETER_ANFRAGE.set(ANFRAGE_BEGONNEN)
         credit_meta = None
         if fallback_kette is not None:
             from src.providers import fallback_faehigkeit as _ff

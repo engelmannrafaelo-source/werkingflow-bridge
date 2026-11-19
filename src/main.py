@@ -4496,6 +4496,9 @@ async def _chat_completions_lauf(
                 # Schema-Strict-Dispatch: Prod-eigener Schluessel, nie Pool (credit_pool.PROD_KEY_ONLY, fail-closed).
                 from src.providers.credit_pool import PROD_KEY_ONLY as _prod_key_only
                 _pko_token = _prod_key_only.set(bool(_strict_dispatch))
+                # H-5 F1: positive Marke "kein Anbieter-Request begonnen" — nur im Schema-Strict-Dispatch.
+                from src.vision_provider import ANBIETER_ANFRAGE as _anbieter_anfrage, ANFRAGE_NICHT_BEGONNEN as _nicht_begonnen
+                _anbieter_anfrage.set(_nicht_begonnen if _strict_dispatch else None)
                 try:
                     response_data = await call_anthropic_direct(
                         request_body, backend_config, messung_ziel=_test_ki_messung,
@@ -4506,6 +4509,11 @@ async def _chat_completions_lauf(
             except Exception as direct_err:
                 # Test-KI-Deckel: nichts gemessen -> Reservierung bleibt voll stehen.
                 await _test_ki_deckel.abrechnen(None)
+                # H-5 F1: nachweislich KEIN Anbieter-Request begonnen -> Strict-Reservierung mit 0 schliessen.
+                from src.vision_provider import ANBIETER_ANFRAGE as _aa, ANFRAGE_NICHT_BEGONNEN as _aa_nicht
+                if _strict_dispatch and _aa.get() == _aa_nicht:
+                    from src.budget.strict_reservation import schliessen_ohne_anbieteraufruf
+                    await schliessen_ohne_anbieteraufruf(type(direct_err).__name__)
                 # H-5 F3 (nur Schema-Strict-Dispatch): Anbieter antwortete 200, die Antwort war unlesbar, die usage
                 # der Rohantwort ist vollstaendig gemessen -> als 'undelivered' (kostentragend) buchen. EIN Buchungsweg:
                 # der Ledger-Schreiber bucht ab und rechnet dabei die Strict-Reservierung ab (wie im Erfolgsweg).

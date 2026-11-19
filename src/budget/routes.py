@@ -685,6 +685,28 @@ async def budget_strict_reserve(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+class StrictSettleRequest(BaseModel):
+    reservationId: uuid.UUID
+
+
+@router.post("/strict/settle")
+async def budget_strict_settle(
+    body: StrictSettleRequest,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Dict[str, Any]:
+    """H-5 F1: offene Strict-Reservierung mit 0 abrechnen (kein Anbieter-Request begonnen). Service-Token only wie
+    /strict/reserve. usedEur unberuehrt; nicht mehr offen -> no-op; unbekannt -> 409; fremder Plan -> 400."""
+    from src.budget.strict_reservation import db_settle_null
+
+    try:
+        erg = await db_settle_null(reservation_id=body.reservationId)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if erg.get("reason") == "reservation_unknown":
+        raise HTTPException(status_code=409, detail="reservation_unknown")
+    return erg
+
+
 @router.post("/deduct")
 async def budget_deduct(
     body: DeductRequest,
