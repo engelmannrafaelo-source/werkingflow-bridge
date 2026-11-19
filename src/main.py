@@ -4429,22 +4429,12 @@ async def _chat_completions_lauf(
             # counted by that ceiling and findable in the audit.
             _cap_over, _cap_spent, _cap_max = await prepaid_vision_over_cap()
             if _cap_over:
-                logger.error(
-                    f"🛑 Prepaid key daily cap reached ({_cap_spent:.2f} of {_cap_max:.2f} EUR) — rejecting direct call (tier={direct_tier})"
-                )
-                return JSONResponse(
-                    status_code=429,
-                    content={
-                        "error": {
-                            "message": (
-                                f"Prepaid Anthropic key daily cap reached "
-                                f"({_cap_spent:.2f} of {_cap_max:.2f} EUR in the last 24h)."
-                            ),
-                            "type": "rate_limit_error",
-                            "code": "prepaid_daily_cap",
-                            "retryable": True,
-                        }
-                    },
+                # Budget cap, not a rate limit (Kanzler 19.11.2026): own type, Retry-After
+                # from the rolling window; stays 429 + retryable so jobs park and retry.
+                from src.routing.prepaid_cap import deckel_antwort, prepaid_frei_in_s
+                return deckel_antwort(
+                    _cap_spent, _cap_max, await prepaid_frei_in_s(_cap_max),
+                    weg="direct", tier=direct_tier, app=request.headers.get("X-App-ID"),
                 )
             logger.info(f"🔀 Routing to direct Anthropic Messages API (tier={direct_tier})")
             direct_attribution = extract_attribution_context(request)

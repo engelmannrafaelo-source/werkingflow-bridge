@@ -19,8 +19,10 @@ Kill switch = set ENABLED=false (no redeploy needed if read per-call, which it i
 """
 
 import logging
+import math
 import os
 import time
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,103 @@ async def query_spent_last_24h_from_db() -> float:
             """
         )
     return float(val or 0.0)
+
+
+#: Retry-After bounds for the cap answer (Kanzler 19.11.2026: taken from the rolling
+#: 24-h window, not a flat 30 s). The job runner clamps again on its side.
+FREI_MIN_S = 60
+FREI_MAX_S = 24 * 3600
+
+# Seconds until the rolling-24h spend falls below the cap: walk the window's rows
+# oldest first; the first row after whose ageing-out the rest is < cap gives the
+# moment (its recorded_at + 24 h). Ties (equal recorded_at) age out together.
+_FREI_SQL = """
+WITH e AS (
+    SELECT recorded_at, hypothetical_cost_eur AS c
+    FROM usage_events
+    WHERE provider_metadata->>'api_key_lane' = 'vision_prepaid'
+      AND recorded_at > now() - interval '24 hours'
+), k AS (
+    SELECT recorded_at,
+           SUM(c) OVER (ORDER BY recorded_at) AS bis,
+           SUM(c) OVER () AS gesamt
+    FROM e
+)
+SELECT CASE
+    WHEN COALESCE((SELECT SUM(c) FROM e), 0) < $1 THEN 0
+    ELSE (SELECT EXTRACT(EPOCH FROM (MIN(recorded_at) + interval '24 hours' - now()))
+          FROM k WHERE gesamt - bis < $1)
+END
+"""
+
+
+async def query_frei_in_s_from_db(cap_eur: float) -> Optional[float]:
+    """Seconds until the rolling-24h prepaid spend is below ``cap_eur`` again
+    (0 = already below). Raises on infra error; callers decide."""
+    from src.db.client import get_pool, is_db_enabled
+
+    if not is_db_enabled():
+        raise RuntimeError("db disabled — cannot evaluate prepaid vision cap window")
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(_FREI_SQL, float(cap_eur))
+    return None if val is None else float(val)
+
+
+async def prepaid_frei_in_s(cap_eur: float) -> Optional[int]:
+    """Retry-After for a cap answer, clamped to [FREI_MIN_S, FREI_MAX_S]; None when
+    unknown (any error — the answer then carries no hint, it never fails)."""
+    from src.platform_client import PlatformUnavailable, call_platform
+
+    try:
+        try:
+            resp = await call_platform(
+                "GET", "/v1/internal/prepaid-vision/spent-24h", params={"cap_eur": cap_eur},
+            )
+        except PlatformUnavailable:
+            roh = await query_frei_in_s_from_db(cap_eur)
+        else:
+            if resp.status_code == 200 and isinstance(resp.json, dict) and "frei_in_s" in resp.json:
+                roh = resp.json["frei_in_s"]
+            else:
+                roh = await query_frei_in_s_from_db(cap_eur)
+    except Exception as e:  # the hint is optional; the 429 itself must never fail
+        logger.warning(f"⚠️ prepaid cap: window drain time unknown ({type(e).__name__}: {e})")
+        return None
+    if roh is None:
+        return None
+    return int(min(FREI_MAX_S, max(FREI_MIN_S, math.ceil(float(roh)))))
+
+
+def deckel_antwort(spent: float, cap: float, frei_in_s: Optional[int], *, weg: str, tier: str, app: Optional[str]):
+    """The 429 of the prepaid daily cap on the direct text path: a BUDGET cap, not a
+    rate limit (type budget_cap_error). Stays 429 + retryable so a job parks and
+    retries (Kanzler 19.11.2026); Retry-After/retry_after_s come from the window."""
+    from fastapi.responses import JSONResponse
+
+    logger.error(
+        f"🛑 PREPAID-DECKEL erreicht ({weg}, tier={tier}, app={app or '-'}): "
+        f"{spent:.2f} von {cap:.2f} EUR in 24 h — frei in "
+        f"{frei_in_s if frei_in_s is not None else 'unbekannt'} s; anheben nur per "
+        f"PREPAID_VISION_DAILY_CAP_EUR (Compose) + Recreate"
+    )
+    err = {
+        "message": (
+            f"Prepaid Anthropic key daily cap reached ({spent:.2f} of {cap:.2f} EUR in the last 24h). "
+            "This is a budget cap, not a rate limit; it lifts as the rolling 24-h window drains"
+            + (f" (in ~{frei_in_s} s)." if frei_in_s is not None else ".")
+        ),
+        "type": "budget_cap_error",
+        "code": "prepaid_daily_cap",
+        "retryable": True,
+        "spent_eur": round(spent, 2),
+        "cap_eur": cap,
+    }
+    headers = {}
+    if frei_in_s is not None:
+        err["retry_after_s"] = frei_in_s
+        headers["Retry-After"] = str(frei_in_s)
+    return JSONResponse(status_code=429, content={"error": err}, headers=headers)
 
 
 async def _spent_last_24h() -> float:

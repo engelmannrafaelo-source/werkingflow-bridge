@@ -67,14 +67,18 @@ async def get_principal_by_hash(
 
 @router.get("/prepaid-vision/spent-24h")
 async def get_prepaid_vision_spent_24h(
+    cap_eur: Optional[float] = None,
     _claims: AuthClaims = Depends(require_service_token),
 ) -> Dict[str, Any]:
     """Mirrors src.routing.prepaid_cap's direct query — rolling-24h prepaid
-    vision spend in EUR. No 404 case: absence of spend is 0.0, not "not found"."""
-    from src.routing.prepaid_cap import query_spent_last_24h_from_db
+    vision spend in EUR. No 404 case: absence of spend is 0.0, not "not found".
+    With ``cap_eur`` also ``frei_in_s``: seconds until the spend is below that cap."""
+    from src.routing.prepaid_cap import query_frei_in_s_from_db, query_spent_last_24h_from_db
 
     spent = await query_spent_last_24h_from_db()
-    return {"spent_eur": spent}
+    if cap_eur is None:
+        return {"spent_eur": spent}
+    return {"spent_eur": spent, "frei_in_s": await query_frei_in_s_from_db(cap_eur)}
 
 
 # ── Schritt 2d: research-cloud daily cap (same shape as prepaid vision) ──
