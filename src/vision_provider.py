@@ -21,6 +21,15 @@ from config.logging_config import get_logger
 from src.model_request import adapt_model_request
 from src.model_registry import get_default_model, model_supports_temperature
 from src.providers import credit_pool
+from contextvars import ContextVar
+
+#: H-5 F1: positive Marke, ob fuer diesen Aufruf schon ein Anbieter-Request (Messages API) begonnen wurde.
+#: Gesetzt auf ANFRAGE_NICHT_BEGONNEN nur vom Schema-Strict-Dispatch in main.py direkt vor dem Aufruf; analyze()
+#: setzt ANFRAGE_BEGONNEN unmittelbar VOR jedem Versand. Nur der exakte Wert ANFRAGE_NICHT_BEGONNEN erlaubt dem
+#: Aufrufer, die Strict-Reservierung mit 0 zu schliessen; None/unbekannt/begonnen -> Reservierung bleibt (R3).
+ANFRAGE_NICHT_BEGONNEN = "nicht_begonnen"
+ANFRAGE_BEGONNEN = "begonnen"
+ANBIETER_ANFRAGE: ContextVar[Optional[str]] = ContextVar("anbieter_anfrage", default=None)
 
 logger = get_logger(__name__)
 
@@ -406,6 +415,7 @@ class VisionProvider:
                 "abo_bildweg" if subscription_fallback else "pool_aus",
             )
         if subscription_fallback:
+            ANBIETER_ANFRAGE.set(ANFRAGE_BEGONNEN)  # H-5 F1: ab hier kann ein Anbieter-Request laufen
             # Abo-Bildweg vor jedem anderen Zweig: kein Pool-Nachversuch, kein
             # bezahlter Schlüssel. Die Prüfung der Kennung wiederholt das Modul.
             from src.providers.subscription_vision import analyze_via_subscription
@@ -479,6 +489,8 @@ class VisionProvider:
 
         adapt_model_request(model, request_body)
 
+        # H-5 F1: ab hier (Pool, Fallback, Stream, POST) kann ein Anbieter-Request laufen.
+        ANBIETER_ANFRAGE.set(ANFRAGE_BEGONNEN)
         credit_meta = None
         if fallback_kette is not None:
             from src.providers import fallback_faehigkeit as _ff
@@ -527,10 +539,15 @@ class VisionProvider:
                 }
             )
             if 400 <= response.status_code < 500 and response.status_code != 429:
-                raise HTTPException(
+                fehler4 = HTTPException(
                     status_code=response.status_code,
                     detail=error_body[:1000]
                 )
+                # H-5 F2: Kennzeichnung NUR aus der echten Anbieterantwort (LB-/Proxy-/Bridge-4xx laufen hier nie durch).
+                fehler4.anbieter = "anthropic"
+                fehler4.anbieter_status = response.status_code
+                fehler4.provider_request_id = _request_id_aus(response)
+                raise fehler4
             raise RuntimeError(
                 f"Anthropic API error ({response.status_code}): {error_body[:200]}"
             )
@@ -549,7 +566,24 @@ class VisionProvider:
             result.provider_request_id = _request_id_aus(response)
             return result
         except UNREADABLE_RESPONSE_ERRORS as exc:
-            raise UpstreamResponseUnreadable("anthropic", exc) from exc
+            fehler = UpstreamResponseUnreadable("anthropic", exc)
+            # H-5 F3: die 200 ist bezahlt — die gemessene usage der Rohantwort reist mit der Ausnahme, damit der
+            # Aufrufer sie buchen kann (Status undelivered). Nicht lesbar/unvollstaendig -> None (nichts erfunden).
+            fehler.usage_messung = _usage_aus_rohantwort(response)
+            fehler.provider_request_id = _request_id_aus(response)   # H-2: Beleg in der F3-Ledgerzeile
+            raise fehler from exc
+
+
+def _usage_aus_rohantwort(response: Any) -> Optional[UsageMessung]:
+    """H-5 F3: UsageMessung aus der 200-Rohantwort, nur wenn vollstaendig (alle vier Felder int >= 0); sonst None."""
+    try:
+        daten = response.json()
+    except Exception:  # noqa: BLE001 — unlesbar: keine Messung, nichts erfinden
+        return None
+    if not isinstance(daten, dict):
+        return None
+    m = usage_messung_aus(daten.get("usage"))
+    return m if m.vollstaendig else None
 
 
 #: S-2: hoechste Gesamtfrist eines gestreamten Schema-Aufrufs (unter dem Chat-Job-Selbstaufruf 2400 s laut Compose).

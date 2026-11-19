@@ -418,6 +418,7 @@ EXCLUDED = {
     "/v1/billing/mollie-webhook": "mutating payment webhook — firing it would create real billing state",
     "/credit-purchases": "mutating billing state",
     "/deduct": "mutating credit balance",
+    "/v1/budget/strict/settle": "mutating budget state (closes a live strict reservation), service token only",
     "/project-pack/checkout": "starts a real payment flow",
     "/issue": "mutating license issuance",
     # --- identity / auth mutations ---
