@@ -533,9 +533,12 @@ async def apply_budget_deduction(
             # ueber limit zulassen — voller Betrag auf usedEur, TopUp-Lose bleiben unberuehrt, Abrechnung normal.
             # G-3: plans.metadata NUR lesen, wenn die Abbuchung das Limit ueberschreiten wuerde (kein plans-Read bei
             # jedem Monatsabzug aller Apps; darunter ist deduct_budget ohnehin identisch).
-            from src.budget.strict_reservation import _euro_pruefung_aus, EURO_PRUEFUNG_AUS
+            from src.budget.strict_reservation import _euro_pruefung_aus, EURO_PRUEFUNG_AUS, STRICT_APP_ID
             _entry = budget.monthly_budgets.get(effective_plan_id)
-            _ueber = _entry is not None and (_entry.used_eur + actual_cost_eur) > _entry.limit_eur
+            # G-4: nur der strikte Plan (Schema-Generator) kennt die Abschaltung (wie db_reserve, das nur der strikte
+            # Pfad aufruft) -> fuer alle anderen Apps nie ein plans-Read, Abbuchungspfad byte-gleich zu F.
+            _ueber = (getattr(requested_plan, "app_id", None) == STRICT_APP_ID and _entry is not None
+                      and (_entry.used_eur + actual_cost_eur) > _entry.limit_eur)
             if _ueber and await _euro_pruefung_aus(conn, effective_plan_id):
                 from src.budget.calculator import BudgetDeductionResult
                 _neu_used = _entry.used_eur + actual_cost_eur
