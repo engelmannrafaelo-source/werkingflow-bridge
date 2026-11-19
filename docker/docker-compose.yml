@@ -132,7 +132,7 @@ services:
       # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
-      - PREPAID_VISION_DAILY_CAP_EUR=90
+      - PREPAID_VISION_DAILY_CAP_EUR=400
       # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
       # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
       # nur Haiku-Chat ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je
@@ -351,7 +351,7 @@ services:
       # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
-      - PREPAID_VISION_DAILY_CAP_EUR=90
+      - PREPAID_VISION_DAILY_CAP_EUR=400
       # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
       # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
       # nur Haiku-Chat ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je
@@ -570,7 +570,7 @@ services:
       # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
-      - PREPAID_VISION_DAILY_CAP_EUR=90
+      - PREPAID_VISION_DAILY_CAP_EUR=400
       # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
       # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
       # nur Haiku-Chat ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je
@@ -789,7 +789,7 @@ services:
       # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
       - PREPAID_VISION_DAILY_CAP_ENABLED=true
-      - PREPAID_VISION_DAILY_CAP_EUR=90
+      - PREPAID_VISION_DAILY_CAP_EUR=400
       # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
       # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
       # nur Haiku-Chat ueber den Direktweg, gedeckelt 0,50 EUR je Lauf, 10 EUR je
