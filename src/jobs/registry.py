@@ -130,11 +130,19 @@ CAPACITY_RETRY_MIN_DELAY_S = 30
 CAPACITY_RETRY_MAX_DELAY_S = 900
 CAPACITY_RETRY_DEFAULT_DELAY_S = 120
 
+#: H-4 B-2 (19.11.2026): Parkgrenze fuer Schema-Bildjobs, gemessen am Jobalter (created_at), nicht an der Parkzahl.
+#: Ein Lauf, den niemand mehr abholt, erzeugt nur Kosten. Grenze = Abfragezeit der Homepage minus laengster Lauf
+#: minus Puffer: heute pollt die Homepage ~22 min, ein 128k-Lauf dauert bei ~132 Token/s ~16 min -> 22 - 16 - 1 = 5 min.
+#: Ein Neustart wird nur geplant, wenn er VOR der Grenze beginnt (Alter + Wartezeit <= Grenze); sonst endet der Job laut.
+#: Mit der geplanten 45-min-Abfrage (dd1a7447) per Env anhebbar, z. B. 1500 s.
+SCHEMA_BILD_PARK_MAX_S = int(os.getenv("BRIDGE_SCHEMA_BILD_PARK_MAX_S", "300"))
+
 
 async def _defer_job(
     job_id: str, kind: str, reason: str, delay_s: int, what: str,
     rejected_by: Optional[str] = None,
     max_defers: int = DEPENDENCY_MAX_DEFERS,
+    max_alter_s: Optional[int] = None,
 ) -> bool:
     """Park a job that must WAIT (dependency down, or no account capacity).
 
@@ -147,6 +155,22 @@ async def _defer_job(
     """
     job = await store_client.get_job(job_id)
     deferred_so_far = (job or {}).get("defer_count") or 0
+    if max_alter_s is not None:
+        # H-4 B-2: der naechste Lauf muss vor der Altersgrenze beginnen. Ohne lesbares created_at: nicht parken (laut).
+        from datetime import datetime, timezone
+        erstellt = (job or {}).get("created_at")
+        if not isinstance(erstellt, datetime):
+            logger.error(f"💀 Async job {job_id} (kind={kind}) not parked: created_at unreadable — {reason[:200]}")
+            return False
+        if erstellt.tzinfo is None:
+            erstellt = erstellt.replace(tzinfo=timezone.utc)
+        alter_s = (datetime.now(timezone.utc) - erstellt).total_seconds()
+        if alter_s + delay_s > max_alter_s:
+            logger.error(
+                f"💀 Async job {job_id} (kind={kind}) not parked: age {alter_s:.0f}s + wait {delay_s}s "
+                f"> limit {max_alter_s}s — {what} — {reason[:200]}"
+            )
+            return False
     if deferred_so_far >= max_defers:
         logger.error(
             f"💀 Async job {job_id} (kind={kind}) gave up after {deferred_so_far} "
@@ -405,9 +429,14 @@ async def _run_body(
         # every local account refused. Park it instead of burning it (see the
         # CAPACITY_RETRY_* block above).
         if isinstance(e, ExecutorHTTPError) and e.status_code == CAPACITY_RETRY_STATUS:
+            from src.jobs.executors import ist_schema_bildjob
+            _bild = kind == "chat" and ist_schema_bildjob(
+                "/v1/chat/completions", payload, (attribution or {}).get("app_id"))
             deferred = await _defer_job(
-                job_id, kind, str(e), _capacity_retry_delay(e), "no account capacity",
+                job_id, kind, str(e), _capacity_retry_delay(e),
+                "no account capacity" + (" (schema image job, loopback-bound)" if _bild else ""),
                 rejected_by=getattr(e, "rejection", None),
+                **({"max_alter_s": SCHEMA_BILD_PARK_MAX_S} if _bild else {}),
             )
             if deferred:
                 return

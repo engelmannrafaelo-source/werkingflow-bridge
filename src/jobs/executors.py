@@ -219,6 +219,26 @@ JOB_REDISPATCH_BASE_URL = os.getenv(
     "BRIDGE_JOB_REDISPATCH_URL", "http://nginx:80"
 ).strip()
 JOB_CAPACITY_REDISPATCH_ATTEMPTS = 1
+
+#: H-4 (19.11.2026): Bildjobs der Schema-App werden bei Kapazitaets-429 NICHT ueber den LB umgeleitet, sondern geparkt.
+#: Der Bild-Selbstaufruf ist an den Loopback gebunden (src/privacy_image/bridge.py chat_pruefen: Job-Kopf UND Peer
+#: 127.0.0.1/::1); ueber den LB kaeme er als fremder Peer an und endete mit 403 image_requires_job. Die Peer-Pruefung
+#: bleibt unveraendert; geparkt laeuft der Job spaeter wieder per Loopback auf einem Worker mit Platz.
+#: NUR werking-schema-generator: Bild-Chatjobs anderer Apps behalten die Umleitung (Review-Auflage B-1).
+SCHEMA_BILD_APP_ID = "werking-schema-generator"
+
+
+def ist_schema_bildjob(path: str, body: Any, app_id: Optional[str]) -> bool:
+    """True genau fuer einen Chat-Selbstaufruf der Schema-App, dessen Koerper ein Bild traegt (oder eine nicht
+    zugelassene Bildform — dann urteilt spaeter der Handler selbst, aber ebenfalls ohne LB-Umweg)."""
+    if path != "/v1/chat/completions" or (app_id or "").strip().lower() != SCHEMA_BILD_APP_ID:
+        return False
+    from src.privacy_image import pruefung
+    from src.privacy_image.fehler import BildFehler
+    try:
+        return pruefung.bild_aus_chat(body) is not None
+    except BildFehler:
+        return True
 JOB_REDISPATCH_PATHS = frozenset({"/v1/chat/completions", "/v1/research"})
 # Diagnostic marker on the re-dispatched request (which worker handed it on).
 REDISPATCH_HEADER = "X-Bridge-Job-Redispatch"
@@ -268,6 +288,8 @@ async def _post_with_capacity_redispatch(
 
     own = _self_identity()
     first = f"self-call refused ({own}; {_describe_rejection(response)})"
+    if ist_schema_bildjob(path, body, headers.get("X-App-ID")):
+        return response, f"{first}; no LB re-dispatch (schema image job is loopback-bound — parked)"
     if path not in JOB_REDISPATCH_PATHS or not JOB_REDISPATCH_BASE_URL:
         why = (
             "path not re-dispatchable"
