@@ -552,6 +552,10 @@ class VisionProvider:
             raise UpstreamResponseUnreadable("anthropic", exc) from exc
 
 
+#: S-2: hoechste Gesamtfrist eines gestreamten Schema-Aufrufs (unter dem Chat-Job-Selbstaufruf 2400 s laut Compose).
+STREAM_GESAMTFRIST_S = 2300.0
+
+
 class _GestreamteAntwort:
     """Antwortobjekt fuer den Aufrufer von _post_messages_gestreamt: dieselben Felder, die analyze() liest
     (status_code, text, json(), headers)."""
@@ -609,8 +613,9 @@ def _stream_zusammensetzen(zeilen: List[str]) -> Dict[str, Any]:
             elif dart == "citations_delta":
                 block.setdefault("citations", []).append(d.get("citation"))
             else:
-                logger.warning("Anthropic-Stream: unbekannte Delta-Art %r (Block %s) nicht uebernommen", dart,
-                               ereignis.get("index"))
+                # S-1 (Review e8511fe6): eine unbekannte Delta-Art koennte Antwortinhalt tragen — nie still verwerfen.
+                raise StreamAbbruch(f"Anthropic-Stream: unbekannte Delta-Art {dart!r} (Block {ereignis.get('index')})"
+                                    " — Antwort nicht vollstaendig zusammensetzbar")
         elif art == "message_delta":
             if nachricht is None:
                 raise StreamAbbruch("Anthropic-Stream: message_delta vor message_start")
@@ -640,6 +645,9 @@ async def _post_messages_gestreamt(url: str, headers: Dict[str, str], request_bo
 
     body = dict(request_body)
     body["stream"] = True
+    # S-2 (Review e8511fe6): Kettenregel — die Stream-Gesamtfrist liegt UNTER dem Chat-Job-Selbstaufruf
+    # (BRIDGE_CHAT_JOB_TIMEOUT_S, Compose 2400 s), damit der Endpunkt zuerst laut antwortet.
+    timeout = min(timeout, STREAM_GESAMTFRIST_S)
 
     async def _lauf() -> "_GestreamteAntwort":
         async with httpx.AsyncClient(timeout=timeout) as client:
