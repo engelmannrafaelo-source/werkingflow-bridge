@@ -531,12 +531,13 @@ async def apply_budget_deduction(
 
             # G-2 (Euro-Pruefung aus, Plan-Feld budget_enforcement exakt "off" am AKTIVEN Plan): Abbuchung
             # ueber limit zulassen — voller Betrag auf usedEur, TopUp-Lose bleiben unberuehrt, Abrechnung normal.
+            # G-3: plans.metadata NUR lesen, wenn die Abbuchung das Limit ueberschreiten wuerde (kein plans-Read bei
+            # jedem Monatsabzug aller Apps; darunter ist deduct_budget ohnehin identisch).
             from src.budget.strict_reservation import _euro_pruefung_aus, EURO_PRUEFUNG_AUS
-            if await _euro_pruefung_aus(conn, effective_plan_id):
+            _entry = budget.monthly_budgets.get(effective_plan_id)
+            _ueber = _entry is not None and (_entry.used_eur + actual_cost_eur) > _entry.limit_eur
+            if _ueber and await _euro_pruefung_aus(conn, effective_plan_id):
                 from src.budget.calculator import BudgetDeductionResult
-                _entry = budget.monthly_budgets.get(effective_plan_id)
-                if _entry is None:
-                    raise BudgetDeductionDenied("BUDGET_EXCEEDED")
                 _neu_used = _entry.used_eur + actual_cost_eur
                 if _neu_used > _entry.limit_eur:
                     logger.warning(
