@@ -497,6 +497,17 @@ class VisionProvider:
             )
         elif credit_pool.pool_for_this_call():
             response, credit_meta = await credit_pool.post_messages(request_body, timeout)
+        elif credit_pool.PROD_KEY_ONLY.get():
+            # G-7b: Schema-Direktweg (nur hier gesetzt) streamt. Ausgabedeckel bis 128k Token laeuft bei ~130 Token/s
+            # ~16 min; ein nicht-streamender POST waere ~16 min still auf der Leitung. Gestreamt kommen laufend
+            # Ereignisse (ping), das Ergebnis wird zur selben Antwortform wie ohne Stream zusammengesetzt.
+            # Weiter genau EIN POST, kein Nachversuch; jeder Abbruch ist laut.
+            response = await _post_messages_gestreamt(
+                self.ANTHROPIC_API_URL,
+                {"Content-Type": "application/json", "x-api-key": self.api_key,
+                 "anthropic-version": self.ANTHROPIC_VERSION},
+                request_body, timeout,
+            )
         else:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(
@@ -539,6 +550,113 @@ class VisionProvider:
             return result
         except UNREADABLE_RESPONSE_ERRORS as exc:
             raise UpstreamResponseUnreadable("anthropic", exc) from exc
+
+
+class _GestreamteAntwort:
+    """Antwortobjekt fuer den Aufrufer von _post_messages_gestreamt: dieselben Felder, die analyze() liest
+    (status_code, text, json(), headers)."""
+
+    def __init__(self, status_code: int, headers: Any, daten: Optional[Dict[str, Any]], text: str):
+        self.status_code = status_code
+        self.headers = headers
+        self._daten = daten
+        self.text = text
+
+    def json(self) -> Dict[str, Any]:
+        if self._daten is None:
+            raise ValueError("keine JSON-Antwort")
+        return self._daten
+
+
+class StreamAbbruch(RuntimeError):
+    """Der Anbieter-Stream endete nicht mit message_stop oder meldete einen Fehler. Nie still abgeschnitten."""
+
+
+def _stream_zusammensetzen(zeilen: List[str]) -> Dict[str, Any]:
+    """SSE-Datenzeilen der Messages API -> dasselbe Objekt wie die nicht-streamende Antwort.
+    Fehlt message_start oder message_stop, oder kommt ein error-Ereignis: StreamAbbruch."""
+    import json as _json
+
+    nachricht: Optional[Dict[str, Any]] = None
+    bloecke: Dict[int, Dict[str, Any]] = {}
+    json_teile: Dict[int, str] = {}
+    gestoppt = False
+    for zeile in zeilen:
+        if not zeile.startswith("data:"):
+            continue
+        roh = zeile[5:].strip()
+        if not roh:
+            continue
+        ereignis = _json.loads(roh)
+        art = ereignis.get("type")
+        if art == "message_start":
+            nachricht = dict(ereignis.get("message") or {})
+            nachricht["usage"] = dict(nachricht.get("usage") or {})
+        elif art == "content_block_start":
+            bloecke[ereignis["index"]] = dict(ereignis.get("content_block") or {})
+        elif art == "content_block_delta":
+            block = bloecke.setdefault(ereignis["index"], {})
+            d = ereignis.get("delta") or {}
+            dart = d.get("type")
+            if dart == "text_delta":
+                block["text"] = block.get("text", "") + d.get("text", "")
+            elif dart == "thinking_delta":
+                block["thinking"] = block.get("thinking", "") + d.get("thinking", "")
+            elif dart == "signature_delta":
+                block["signature"] = d.get("signature")
+            elif dart == "input_json_delta":
+                json_teile[ereignis["index"]] = json_teile.get(ereignis["index"], "") + d.get("partial_json", "")
+            elif dart == "citations_delta":
+                block.setdefault("citations", []).append(d.get("citation"))
+            else:
+                logger.warning("Anthropic-Stream: unbekannte Delta-Art %r (Block %s) nicht uebernommen", dart,
+                               ereignis.get("index"))
+        elif art == "message_delta":
+            if nachricht is None:
+                raise StreamAbbruch("Anthropic-Stream: message_delta vor message_start")
+            for k, v in (ereignis.get("delta") or {}).items():
+                nachricht[k] = v
+            nachricht["usage"].update(ereignis.get("usage") or {})
+        elif art == "message_stop":
+            gestoppt = True
+        elif art == "error":
+            raise StreamAbbruch(f"Anthropic-Stream meldet Fehler: {_json.dumps(ereignis.get('error'))[:300]}")
+    if nachricht is None or not gestoppt:
+        raise StreamAbbruch(
+            "Anthropic-Stream ohne " + ("message_start" if nachricht is None else "message_stop")
+            + " beendet — Antwort unvollstaendig, nicht als Erfolg gewertet")
+    for i, teil in json_teile.items():
+        bloecke.setdefault(i, {})["input"] = _json.loads(teil) if teil else {}
+    nachricht["content"] = [bloecke[i] for i in sorted(bloecke)]
+    return nachricht
+
+
+async def _post_messages_gestreamt(url: str, headers: Dict[str, str], request_body: Dict[str, Any],
+                                   timeout: float) -> "_GestreamteAntwort":
+    """EIN Messages-POST mit stream=true (G-7b, nur Schema-Direktweg). Gesamtfrist = timeout (wie bisher der
+    Lese-Timeout des nicht-streamenden POST); ueberschritten -> httpx.ReadTimeout wie dort. Nicht-200: Status und
+    Text unveraendert zurueck, die bisherige Fehlerbehandlung in analyze() greift."""
+    import asyncio
+
+    body = dict(request_body)
+    body["stream"] = True
+
+    async def _lauf() -> "_GestreamteAntwort":
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", url, headers=headers, json=body) as antwort:
+                if antwort.status_code != 200:
+                    roh = await antwort.aread()
+                    return _GestreamteAntwort(antwort.status_code, antwort.headers, None,
+                                              roh.decode("utf-8", "replace"))
+                zeilen = [z async for z in antwort.aiter_lines()]
+                daten = _stream_zusammensetzen(zeilen)
+                import json as _json
+                return _GestreamteAntwort(200, antwort.headers, daten, _json.dumps(daten))
+
+    try:
+        return await asyncio.wait_for(_lauf(), timeout=timeout)
+    except asyncio.TimeoutError as e:
+        raise httpx.ReadTimeout(f"Anthropic-Stream: keine vollstaendige Antwort binnen {timeout:.0f} s") from e
 
 
 def _request_id_aus(response: Any) -> Optional[str]:
