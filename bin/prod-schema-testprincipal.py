@@ -297,7 +297,7 @@ class Ablage:
 def vorab(b, abl):
     """Nur lesend. Liefert die Liste der Hinderungsgruende (leer = frei)."""
     st, j, _ = b.req("GET", "/health", operator=False)
-    if st != 200 or not isinstance(j, dict) or j.get("status") != "ok":
+    if st != 200 or not isinstance(j, dict) or j.get("status") != "healthy":
         raise Vorbedingung(f"GET /health: {st}")
     st, j, _ = b.req("GET", "/v1/billing/plans", operator=False)
     pl = [p for p in ((j or {}).get("plans") or []) if p.get("id") == PLAN] if isinstance(j, dict) else []
