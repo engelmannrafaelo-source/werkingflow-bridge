@@ -89,6 +89,18 @@ SPUREN_SQL = ("select (select count(*) from usage_events where user_id=$1::uuid)
               "(select count(*) from budget_reservations where user_id=$1::uuid) reservierungen")
 
 
+def pin_von(j):
+    """provider_config wie geliefert: GET /v1/users/{id} gibt am 8bcf742 einen JSON-STRING (admin_routes.py:470 json.dumps,
+    Lesen ohne Dekodierung; live 19.11. 24/24 str). Nicht-JSON bleibt als Text und vergleicht damit ungleich."""
+    pc = (j or {}).get("provider_config") if isinstance(j, dict) else None
+    if isinstance(pc, str):
+        try:
+            return json.loads(pc)
+        except ValueError:
+            return pc
+    return pc
+
+
 def zeile(t):
     print(t, flush=True)
 
@@ -357,7 +369,7 @@ def anlegen(b, abl, a):
             raise Abbruch(f"PATCH Pin: {st}")
         beleg["pin_gesetzt_epoch"] = int(time.time())
         st, ru, _ = b.req("GET", f"/v1/users/{uid}")
-        if st != 200 or (ru or {}).get("provider_config") != PIN:
+        if st != 200 or pin_von(ru) != PIN:
             raise Abbruch("Pin-Readback abweichend")
         zeile("PASS Pin anthropic_direct (Readback); wirksam in den Workern nach <= 60 s")
         principal_anlegen(b, abl, beleg, uid)
@@ -439,7 +451,7 @@ def pruefe(b, abl, beleg):
     ok_id, j = identitaet(b, beleg)
     liz = (j or {}).get("app_licenses") or []
     lizenz = len(liz) == 1 and liz[0].get("app_id") == APP and liz[0].get("plan_id") == PLAN
-    pin = (j or {}).get("provider_config") == PIN
+    pin = pin_von(j) == PIN
     typ = b.typ_test(TENANT_ID)
     mitglieder = sorted(str(u.get("id")) for u in b.nutzer() if u.get("tenant_id") == TENANT_ID)
     allein = mitglieder == [beleg.get("user_id")]
@@ -613,7 +625,7 @@ def abbau_schritte(b, abl, a, beleg, worker, n):
     # 3. Pin loesen
     st, _, _ = b.req("PATCH", f"/v1/users/{uid}", {"provider_config": {}})
     st2, ru, _ = b.req("GET", f"/v1/users/{uid}")
-    n["pin_geloest"] = st == 200 and st2 == 200 and not (ru or {}).get("provider_config")
+    n["pin_geloest"] = st == 200 and st2 == 200 and not pin_von(ru)
     # 4. Abo kuendigen
     if beleg.get("sub_id"):
         st, _, _ = b.req("POST", f"/v1/billing/{uid}/subscriptions/{beleg['sub_id']}/cancel")
