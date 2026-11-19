@@ -415,11 +415,16 @@ async def _run_body(
             delay_s, max_defers = DEPENDENCY_PATIENCE.get(
                 dependency or "", (DEPENDENCY_RETRY_DELAY_S, DEPENDENCY_MAX_DEFERS)
             )
+            from src.jobs.executors import ist_schema_bildjob
+            _bild_dep = kind == "chat" and ist_schema_bildjob(
+                "/v1/chat/completions", payload, (attribution or {}).get("app_id"))
             deferred = await _defer_job(
                 job_id, kind, str(e), delay_s,
                 f"dependency unreachable ({dependency})" if dependency
                 else "dependency unreachable",
                 max_defers=max_defers,
+                # H-4b: dieselbe Altersgrenze wie im Kapazitaetszweig (kein Lauf ohne Abholer).
+                **({"max_alter_s": SCHEMA_BILD_PARK_MAX_S} if _bild_dep else {}),
             )
             if deferred:
                 return
