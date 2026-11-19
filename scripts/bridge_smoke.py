@@ -441,6 +441,12 @@ EXCLUDED = {
     "/v1/models": "static model list (covered indirectly by chat/completions)",
     "/v1/auth/status": "auth-key echo, covered indirectly by every authed probe",
     "/v1/privacy/status": "flag echo, the real contract is asserted by the smart-anonymize probe",
+    # --- Bild-PII-Maske (c9a50d3b, 18.11.2026): bewusst KEIN Smoke-Aufruf. image-mask schickt ein Bild an den
+    #     Privacy-Dienst und stellt im final-Modus ein Einmal-Token aus; image-receipt legt einen Receipt in der DB an.
+    #     Beides ist mutierend bzw. PII-nah und darf bei einem Deploy nie feuern. Vertrag offline belegt durch die
+    #     Proben (receipt/pruefung/chat/store); bis zum Shared-Privacy-Slot antwortet der Weg fail-closed 503. ---
+    "/v1/privacy/image-mask": "mutating/PII: sends an image to the privacy service and mints a one-time token; never fired on deploy",
+    "/v1/privacy/image-receipt": "mutating: creates an image receipt row; never fired on deploy",
     "/v1/usage/status": "read-only usage counters, covered indirectly by metrics probe",
     # --- convert-family variants: primary PDF path covered by document_convert;
     #     these are alternate in/out shapes. TODO: dedicated fixtures + probes. ---

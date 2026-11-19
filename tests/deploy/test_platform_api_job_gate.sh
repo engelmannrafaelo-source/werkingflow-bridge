@@ -35,26 +35,123 @@ rssh() {
         return "${probe_rc:-0}"
     fi
 }
+site_probe() { local s; s=$(platform_api_job_gate_probe_site "$1"); platform_api_job_gate_probe ${s%% *} "$2" ${s#* }; }
 running="w3" probe_rc=0
-platform_api_job_gate_probe $(platform_api_job_gate_probe_site HETZNER)
-grep -q "rssh hz docker exec -i 'w3' python3 -" "$commands"
+site_probe HETZNER ""
+grep -q "rssh hz docker exec -i 'w3' python3 - $" "$commands"
 echo 'PASS dev: probe runs in the first running dev worker'
 : > "$commands"
 running="ku" probe_rc=1
-rc=0; platform_api_job_gate_probe $(platform_api_job_gate_probe_site SERVER2) || rc=$?
+rc=0; site_probe SERVER2 "" || rc=$?
 [[ $rc == 1 ]]
 grep -q "rssh wh docker exec -i 'ku' python3 -" "$commands"
 echo 'PASS prod: probe runs on the worker host (ADR-0009), not on server2'
 running=""
-rc=0; platform_api_job_gate_probe $(platform_api_job_gate_probe_site HETZNER) > /dev/null || rc=$?
+rc=0; site_probe HETZNER "" > /dev/null || rc=$?
 [[ $rc == 2 ]]
 echo 'PASS no running worker: not provable'
+: > "$commands"
+running="w1" probe_rc=4
+rc=0; site_probe HETZNER "--peer-remote prod" || rc=$?
+[[ $rc == 4 ]]
+grep -q "rssh hz docker exec -i 'w1' python3 - --peer-remote prod$" "$commands"
+echo 'PASS P1: the local probe is told which peer is asked from the peer side'
+
+# --- P1: remote (peer-side) probe, exact host/container binding, fail-closed ---
+remote_host="prod-workers-1" remote_running="ku" remote_rc=0 ssh_fail="" fremd_name=""
+rssh() {
+    echo "rssh $*" >> "$commands"
+    [[ -n "$ssh_fail" ]] && return 255
+    if [[ "$2" == hostname ]]; then echo "$remote_host"; return 0; fi
+    if [[ "$*" == *'{{.Name}} {{.State.Running}}'* ]]; then
+        local c
+        [[ -n "$fremd_name" ]] && { echo "$fremd_name true"; return 0; }
+        for c in $remote_running; do [[ "$*" == *"'$c'"* ]] && { echo "/$c true"; return 0; }; done
+        echo "/x false"; return 0
+    fi
+    if [[ "$*" == *'docker exec -i'* ]]; then cat > /dev/null; return "$remote_rc"; fi
+}
+rp() { local rc=0; platform_api_job_gate_remote_probe prod dev wh sa ku co er > /dev/null || rc=$?; echo "$rc"; }
+: > "$commands"
+[[ $(rp) == 0 ]]
+grep -q "rssh wh timeout 60 docker exec -i 'ku' python3 - --eigen 'prod' --heimat 'dev'" "$commands"
+absent 'FEDERATION_TOKEN'
+absent 'BRIDGE_SERVICE_TOKEN'
+echo 'PASS P1 remote: asks in the first running prod worker, origin args only, no credential in argv'
+if ( PLATFORM_API_JOBGATE_REMOTE_HOSTNAME=x ) 2>/dev/null; then echo 'FAIL hostname overridable'; exit 1; fi
+[[ "$PLATFORM_API_JOBGATE_REMOTE_HOSTNAME" == prod-workers-1 ]]
+echo 'PASS P1 remote: expected host name is fixed (readonly)'
+remote_rc=1; [[ $(rp) == 1 ]]; echo 'PASS P1 remote: busy stays busy'
+for bad in 2 3 4 124 125 126 127 137 255; do remote_rc=$bad; [[ $(rp) == 2 ]] || { echo "FAIL remote rc $bad"; exit 1; }; done
+remote_rc=0
+echo 'PASS P1 remote: every other probe rc (timeout 124, docker 125-127, kill, ssh) is an error'
+remote_host="Production-Bridge"; [[ $(rp) == 2 ]]; remote_host="prod-workers-1"
+echo 'PASS P1 remote: wrong host name is an error'
+remote_running="wt-worker-host-kurtX"; [[ $(rp) == 2 ]]; remote_running="ku"
+echo 'PASS P1 remote: only the exact container names count'
+fremd_name="/wt-worker-host-kurt-alt"; [[ $(rp) == 2 ]]; fremd_name=""
+echo 'PASS P1 remote: docker answering with ANOTHER container name (prefix/ID match) is an error'
+remote_running=""; [[ $(rp) == 2 ]]; remote_running="ku"
+echo 'PASS P1 remote: no running container is an error'
+ssh_fail=1; [[ $(rp) == 2 ]]; ssh_fail=""
+echo 'PASS P1 remote: ssh failure is an error'
+rc=0; platform_api_job_gate_remote_probe prod dev wh "ku;rm" > /dev/null || rc=$?; [[ $rc == 2 ]]
+echo 'PASS P1 remote: malformed container name is refused before ssh'
+
+# --- A-GP-3: local deadline around every remote call ---
+rc=0; mit_frist 1 command sleep 5 || rc=$?; [[ $rc == 124 ]]
+rc=0; mit_frist 5 bash -c 'exit 3' || rc=$?; [[ $rc == 3 ]]
+[[ $(printf 'durch\n' | mit_frist 5 cat) == durch ]]
+# A function must NOT resume after the deadline (dcb97ae: subshell and children end in one kill).
+weiter=$(mktemp -u); f_weiter() { command sleep 5; : > "$weiter"; }
+rc=0; mit_frist 1 f_weiter || rc=$?; [[ $rc == 124 ]]; command sleep 1; [[ ! -e "$weiter" ]]
+echo 'PASS A-GP-3: mit_frist ends a hanging call with 124 (no resume after the deadline), keeps rc and stdin otherwise'
+haenge=""
+rssh_alt=$(declare -f rssh)
+rssh() { echo "rssh $*" >> "$commands"; [[ "$*" == *"$haenge"* && -n "$haenge" ]] && command sleep 30; [[ "$2" == hostname ]] && { echo prod-workers-1; return 0; }
+         [[ "$*" == *'{{.Name}}'* ]] && { echo "/ku true"; return 0; }; [[ "$*" == *'docker exec -i'* ]] && { cat > /dev/null; return 0; }; }
+PLATFORM_API_JOBGATE_SSH_FRIST_S=1
+for h in hostname "docker inspect" "docker exec"; do
+    haenge="$h"; t0=$SECONDS; [[ $(rp) == 2 ]] || { echo "FAIL hang in $h not an error"; exit 1; }; (( SECONDS - t0 < 10 )) || { echo "FAIL hang in $h not bounded"; exit 1; }
+done
+haenge=""; [[ $(rp) == 0 ]]
+PLATFORM_API_JOBGATE_SSH_FRIST_S=90
+eval "$rssh_alt"
+echo 'PASS A-GP-3: a hanging hostname/inspect/exec is bounded locally and refused'
+
+# --- P1: combined round (local probe + remote probe) ---
+platform_api_job_gate_probe() { echo "PROBE $*" >> "$commands"; return "$local_rc"; }
+platform_api_job_gate_remote_probe() { echo "REMOTE $*" >> "$commands"; return "$remote_rc"; }
+round() { local rc=0; local_rc=$1 remote_rc=$2; platform_api_job_gate_round "$3" > /dev/null || rc=$?; echo "$rc"; }
+chk() { local got; got=$(round "$1" "$2" "$3"); [[ "$got" == "$4" ]] || { echo "FAIL round $*: got $got"; exit 1; }; }
+#    local remote prefix  want
+chk  4 0 HETZNER 0
+chk  4 1 HETZNER 1
+chk  4 2 HETZNER 2
+chk  1 0 HETZNER 1
+chk  1 2 HETZNER 2
+chk  2 0 HETZNER 2
+chk  3 0 HETZNER 3
+chk  3 1 HETZNER 1
+chk  0 0 HETZNER 2
+chk  255 0 HETZNER 2
+chk  4 0 SERVER2 2
+chk  0 0 SERVER2 0
+chk  1 0 SERVER2 1
+: > "$commands"; round 4 0 HETZNER > /dev/null
+grep -q '^REMOTE prod dev wh sa ku co er$' "$commands"
+grep -q '^PROBE hz --peer-remote prod w1 w2 w3 w4$' "$commands"
+: > "$commands"; round 0 0 SERVER2 > /dev/null
+absent '^REMOTE'
+grep -q '^PROBE wh  sa ku co er$' "$commands"
+echo 'PASS P1 round: release only with local 4 (peer pending) AND remote idle; errors win; server2 unchanged'
 
 # --- decision over probe results ---
 results=$(mktemp)
 trap 'rm -f "$commands" "$functions" "$results"' EXIT
 # Runs in a $(...) subshell inside the gate, so the queue lives in a file.
-platform_api_job_gate_probe() {
+# Since P1 the gate asks platform_api_job_gate_round (local + remote combined).
+platform_api_job_gate_round() {
     local next
     next=$(head -n1 "$results")
     sed -i 1d "$results"
@@ -119,13 +216,20 @@ step() { :; }
 rssh() { echo "rssh $*" >> "$commands"; }
 HETZNER_COMPOSE=compose HETZNER_ALL="platform-api worker1"
 HETZNER_NEEDS_BUILD="platform-api" HETZNER_DB_CONTAINER=db HETZNER_SVC_platform_api=wt-platform-api
-SERVICES_ARG=() REMOTE_REPO=/repo HEALTH_TIMEOUT=1
+# HEALTH_TIMEOUT 30, not 1 (A-R2-1): with 1 s a second rollover between deadline and first check skipped the
+# health loop entirely -> 'Health timeout', no NACHHER, silent abort (1/11 under load). The rssh stub answers
+# 'healthy' at once, so nothing waits; the deploy itself uses 360 s.
+SERVICES_ARG=() REMOTE_REPO=/repo HEALTH_TIMEOUT=30
 phase_tooling_freshness_gate() { :; }
 phase_prod_order_gate() { :; }
 phase_preflight() { :; }
 phase_code_update() { ROLLBACK_SHA=synthetic-sha; }
 phase_validate() { :; }
 phase_reconcile_worker_key() { :; }
+phase_reconcile_account_policy() { :; }   # Attrappe seit 573edfe (keep-host Account-Policy); Test brach vor P1 hier ab
+log_sichern() { :; }   # Attrappe (Test war vor P1 veraltet)
+LOG_SICHERUNG_RC=4   # wie scripts/log-sicherung.sh:38
+log_sicherung_vorpruefung() { :; }   # Attrappe (Test war vor P1 veraltet)
 phase_migration_gate() { :; }
 prepare_erkunder_deploy() { :; }
 phase_rollback() { echo "ROLLBACK $*" >> "$commands"; }
@@ -162,6 +266,7 @@ rssh() {
     return 0
 }
 deployed_bridge_id() { :; }
+platform_api_job_gate_nachher() { echo "NACHHER $*" >> "$commands"; }
 phase_smoke_test() { :; }
 phase_distribution_test() { :; }
 phase_access_canary() { :; }
@@ -176,6 +281,11 @@ first_up=$(grep -n 'up -d' "$commands" | head -n1 | cut -d: -f1)
 [[ -n "$first_up" && $first_gate -lt $first_up ]]
 grep 'up -d' "$commands" | head -n1 | grep -q 'postgres-prod'
 echo 'PASS server2 gate passes: asked once, before postgres-prod is recreated'
+[[ $(grep -c '^NACHHER SERVER2$' "$commands") == 1 ]]
+nachher=$(grep -n '^NACHHER' "$commands" | cut -d: -f1)
+pa_up=$(grep -n 'up -d.*platform-api' "$commands" | head -n1 | cut -d: -f1)
+[[ -n "$pa_up" && $nachher -gt $pa_up ]]
+echo 'PASS P1/BR7: read-only after-record exactly once, after the platform-api recreation'
 
 # Only the database on server2 also needs the gate; nginx alone does not.
 platform_api_job_gate() { echo "GATE $*" >> "$commands"; return 3; }
@@ -190,3 +300,56 @@ deploy_server server2 > /dev/null 2>&1 || true
 absent '^GATE'
 SERVICES_ARG=()
 echo 'PASS server2: postgres-prod alone is gated, nginx alone is not'
+
+# --- A-GP-1: second gate round right before the platform-api recreation (hetzner) ---
+gate_runden=$(mktemp)
+HETZNER_SVC_nginx=nginx HETZNER_SVC_worker1=w1
+SERVICES_ARG=(platform-api)   # Worker liefen sonst in die 900-s-ready_for_shutdown-Schleife (sleep gemockt)
+measure_pool_before_deploy() { :; }
+lb_nach_workerwechsel() { echo "LB $*" >> "$commands"; return 0; }
+platform_api_job_gate() { echo "GATE $*" >> "$commands"; local n; n=$(head -n1 "$gate_runden"); sed -i 1d "$gate_runden"; return "${n:-3}"; }
+printf '0\n3\n' > "$gate_runden"
+: > "$commands"
+rc=0; deploy_server hetzner > /dev/null 2>&1 || rc=$?
+[[ $rc != 0 ]]
+[[ $(grep -c '^GATE HETZNER$' "$commands") == 2 ]]
+grep -q 'build --no-cache platform-api' "$commands"
+absent 'up -d --no-deps --force-recreate platform-api'
+absent '^ROLLBACK'
+grep -q "git reset --hard 'synthetic-sha'" "$commands"
+first_build=$(grep -n 'build --no-cache platform-api' "$commands" | head -n1 | cut -d: -f1)
+second_gate=$(grep -n '^GATE HETZNER$' "$commands" | sed -n 2p | cut -d: -f1)
+(( second_gate > first_build ))
+echo 'PASS A-GP-1: second round after the build refuses -> no recreation, no rollback recreation, code reset'
+printf '0\n0\n' > "$gate_runden"
+: > "$commands"
+deploy_server hetzner > /dev/null 2>&1 || true
+[[ $(grep -c '^GATE HETZNER$' "$commands") == 2 ]]
+second_gate=$(grep -n '^GATE HETZNER$' "$commands" | sed -n 2p | cut -d: -f1)
+pa_up=$(grep -n 'up -d --no-deps --force-recreate platform-api' "$commands" | head -n1 | cut -d: -f1)
+[[ -n "$pa_up" ]] && (( second_gate < pa_up ))
+echo 'PASS A-GP-1: second round idle -> recreation follows directly after it'
+SERVICES_ARG=()
+printf '0\n' > "$gate_runden"
+: > "$commands"
+deploy_server server2 > /dev/null 2>&1 || true
+[[ $(grep -c '^GATE SERVER2$' "$commands") == 1 ]]
+echo 'PASS A-GP-1: server2 keeps one round (postgres-prod first, BR8R M1)'
+rm -f "$gate_runden"
+
+# --- A-GP-2: read-only after-record also after a rollback that recreates platform-api ---
+python3 - "$functions" <<'PY2'
+import re, sys
+from pathlib import Path
+src = Path('scripts/bridge-deploy.sh').read_text()
+Path(sys.argv[1]).write_text(re.search(r'^phase_rollback\(\) *\{.*?^\}', src, re.M | re.S)[0])
+PY2
+source "$functions"
+_phase_rollback_kern() { echo "KERN $*" >> "$commands"; return "${kern_rc:-0}"; }
+platform_api_job_gate_nachher() { echo "NACHHER $*" >> "$commands"; }
+JOBGATE_NACHHER_PREFIX=HETZNER DRY_RUN=false
+: > "$commands"; kern_rc=0; phase_rollback hz compose sha bl platform-api worker1; grep -q '^NACHHER HETZNER$' "$commands"
+: > "$commands"; kern_rc=2; rc=0; phase_rollback hz compose sha bl worker1 platform-api || rc=$?; [[ $rc == 2 ]]; grep -q '^NACHHER HETZNER$' "$commands"
+: > "$commands"; kern_rc=0; phase_rollback hz compose sha bl worker1 worker2; absent '^NACHHER'
+JOBGATE_NACHHER_PREFIX=""; : > "$commands"; phase_rollback hz compose sha bl platform-api; absent '^NACHHER'
+echo 'PASS A-GP-2: after-record after every rollback with platform-api (also a failed one, rc kept), never otherwise'

@@ -1098,11 +1098,12 @@ deploy_one_service() {
     # through correctly.
     if [[ "$svc" != erkunder ]] && service_needs_build "$svc" "$build_list"; then
         info "Building ${svc}..."
+        local bau_start=$SECONDS
         dry_rssh "$host" "cd ${REMOTE_REPO} && GIT_COMMIT=\$(git rev-parse HEAD) docker compose ${compose} build --no-cache ${svc} 2>&1" || {
             error_ "Build failed for ${svc} on ${host}"
             return 1
         }
-        info "Build OK"
+        info "Build OK (${svc}: $(( SECONDS - bau_start ))s)"
     else
         info "${svc} uses pre-built image — skipping build"
     fi
@@ -1130,6 +1131,19 @@ deploy_one_service() {
         error_ "Log-Sicherung fuer ${container} nicht belegt — ${svc} wird NICHT neu erzeugt"
         return "$LOG_SICHERUNG_RC"
     }
+
+    # A-GP-1 (Review P1): the first gate round ran BEFORE the --no-cache build;
+    # jobs that started meanwhile were not seen. Ask again immediately before the
+    # platform-api recreation (only where platform-api is the first recreated
+    # service, see JOBGATE_ZWEITRUNDE_PREFIX). Refused = no recreation and, since
+    # nothing was recreated, no rollback recreation either.
+    if [[ "$DRY_RUN" == "false" && "$svc" == platform-api && -n "${JOBGATE_ZWEITRUNDE_PREFIX:-}" ]]; then
+        info "platform-api job gate, second round (after build, before recreation)"
+        platform_api_job_gate "$JOBGATE_ZWEITRUNDE_PREFIX" || {
+            error_ "platform-api job gate refused right before the recreation — ${svc} is NOT recreated"
+            return "$JOBGATE_VOR_RECREATE_RC"
+        }
+    fi
 
     # Recreate — NEVER --remove-orphans
     info "Recreating ${svc}..."
@@ -2115,7 +2129,19 @@ lb_nach_workerwechsel() {
 # ============================================================================
 # Phase 6: Rollback
 # ============================================================================
+# A-GP-2 (Review P1): every rollback that recreates platform-api opens another
+# gap; record the active/parked jobs after it, read-only, like after a deploy.
 phase_rollback() {
+    local rc=0
+    _phase_rollback_kern "$@" || rc=$?
+    shift 4
+    if [[ "$DRY_RUN" == "false" && -n "${JOBGATE_NACHHER_PREFIX:-}" && " $* " == *" platform-api "* ]]; then
+        platform_api_job_gate_nachher "$JOBGATE_NACHHER_PREFIX"
+    fi
+    return "$rc"
+}
+
+_phase_rollback_kern() {
     local host="$1"
     local compose="$2"
     local sha="$3"
@@ -3348,7 +3374,13 @@ deploy_server() {
     # recreated first, and a refusal after that would leave one DB gap and
     # the rollback would add a second one (BR8R M1). Refused = nothing was
     # recreated, nothing is rolled back, only the code is reset.
+    JOBGATE_ZWEITRUNDE_PREFIX=""; JOBGATE_NACHHER_PREFIX=""
     if platform_api_job_gate_needed "$server_prefix" "${services_to_deploy[@]}"; then
+        JOBGATE_NACHHER_PREFIX="$server_prefix"
+        # Second round only where platform-api is recreated FIRST (HETZNER): a
+        # refusal there leaves nothing recreated. On server2 postgres-prod comes
+        # first; a late refusal would force a rollback recreation (BR8R M1).
+        [[ "$server_prefix" == HETZNER ]] && JOBGATE_ZWEITRUNDE_PREFIX="$server_prefix"
         platform_api_job_gate "$server_prefix" || {
             error_ "Deploy refused before any container was recreated — reverting code to ${ROLLBACK_SHA}"
             if [[ "$DRY_RUN" == "false" ]]; then
@@ -3384,6 +3416,10 @@ deploy_server() {
         fi
         local dos_rc=0
         deploy_one_service "$host" "$compose" "$svc" "$container" "$build_list" || dos_rc=$?
+        if (( dos_rc == JOBGATE_VOR_RECREATE_RC )); then
+            # Not recreated (A-GP-1): no rollback recreation for it.
+            DEPLOYED_SERVICES=("${DEPLOYED_SERVICES[@]:0:vorher}")
+        fi
         if (( dos_rc == LOG_SICHERUNG_RC )); then
             # Not recreated: drop it (and its erkunder group) from the rollback set.
             DEPLOYED_SERVICES=("${DEPLOYED_SERVICES[@]:0:vorher}")
@@ -3393,7 +3429,12 @@ deploy_server() {
             fi
         fi
         if (( dos_rc == 0 )); then
-            :
+            # P1/BR7: read-only record right after the platform-api gap — which
+            # jobs are active or parked now (never changes the deploy result).
+            if [[ "$svc" == platform-api && "$DRY_RUN" == "false" ]] \
+                    && platform_api_job_gate_needed "$server_prefix" "${services_to_deploy[@]}"; then
+                platform_api_job_gate_nachher "$server_prefix"
+            fi
         else
             error_ "Deploy failed for ${svc} (rc=${dos_rc}) — initiating rollback of recreated services only"
             if [[ ${#DEPLOYED_SERVICES[@]} -gt 0 ]]; then

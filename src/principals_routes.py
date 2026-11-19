@@ -13,7 +13,7 @@ import secrets
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from src.api_auth import require_admin, AuthClaims
 from src.db.client import is_db_enabled
@@ -34,6 +34,14 @@ class CreatePrincipalRequest(BaseModel):
     allowed_apps: List[str] = Field(default_factory=list)
     allowed_paths: Optional[List[str]] = None
     monthly_cap_eur: Optional[float] = Field(default=None, ge=0)
+
+    @field_validator("allowed_paths")
+    @classmethod
+    def _paths_nicht_leer(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        # [] hiesse "zu" (principals.may_use_path). Weglassen = Joker wie bisher; leer ist ein Fehler -> 422.
+        if v is not None and len(v) == 0:
+            raise ValueError("allowed_paths must not be empty; omit the field for ['*'] or list explicit paths")
+        return v
 
 
 class RotatePrincipalRequest(BaseModel):

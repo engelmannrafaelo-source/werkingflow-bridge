@@ -300,7 +300,14 @@ def _haengt_an_harter_pii(start: int, ende: int, text: str, harte_bereiche: List
 
 
 def _alle_vorkommen(text: str, wert: str) -> set:
-    return {(m.start(), m.end()) for m in re.finditer(re.escape(wert), text)}
+    """Vorkommen des Werts als eigenes Token: kein Buchstabe und keine Ziffer (Unicode) unmittelbar davor/danach.
+    "T-01" in "WT-01", "RLT-01", "T-012", "ÄT-01" ist eine ANDERE Kennung, kein Vorkommen von "T-01" (Privacy-FAIL
+    de364 18.11.: diese Teilwort-Stellen wurden als "eingebettet" zusaetzlich maskiert -> "WANON_..." -> contract.js
+    rejectContactRemnants 502). Gleiche Grenze wie die Retention-Gegenprobe (pipeline._technische_retentionen) und
+    der Mapping-Abgleich der Homepage (contract.js: (?<![\\p{L}\\p{N}])). Unterstrich und Satzzeichen sind KEINE
+    Grenze: "FI-01_alt", "Filter_FI-01", "/KV-01", "B-02-Neu" bleiben Vorkommen und werden wie bisher als
+    "eingebettet" maskiert (R3b, Adapter-Abgleich 451d80c)."""
+    return {(m.start(), m.end()) for m in re.finditer(r"(?<![^\W_])" + re.escape(wert) + r"(?![^\W_])", text)}
 
 
 def _texte(text: str) -> List[Tuple[int, int]]:
@@ -550,10 +557,13 @@ async def kontext_verifiziert(request: Any, context_hint: Optional[str], *, aufr
     from src.routing.schema_bedrock_guard import SCHEMA_APP_ID
     if _resolve_app_id(request) == (SCHEMA_APP_ID, "principal"):
         return True
-    from src.jobs.selbstaufruf import JOB_LAUF_HEADER
-    job_id = (request.headers.get(JOB_LAUF_HEADER) or "").strip()
+    from src.jobs.selbstaufruf import JOB_KONTEXT_HEADER, JOB_LAUF_HEADER
+    job_id = (request.headers.get(JOB_KONTEXT_HEADER) or request.headers.get(JOB_LAUF_HEADER) or "").strip()
     peer = getattr(getattr(request, "client", None), "host", None)
     if not job_id or peer not in ("127.0.0.1", "::1"):
+        # Live-FAIL 7740f932 lief still hier hinaus: Grund sichtbar machen (nur Code, keine Inhalte/Kennungen).
+        logger.warning("privacy anlagenkontext: nicht verifiziert (%s) — unchanged masking",
+                       "kein-job-kopf" if not job_id else "peer-nicht-loopback")
         return False
     from src.jobs import store_client
     try:
@@ -562,7 +572,11 @@ async def kontext_verifiziert(request: Any, context_hint: Optional[str], *, aufr
         logger.error("privacy anlagenkontext: job store not readable (%s) — unchanged masking", type(e).__name__)
         return False
     if not isinstance(job, dict) or job.get("status") != "running":
+        logger.warning("privacy anlagenkontext: nicht verifiziert (job-nicht-laufend) — unchanged masking")
         return False
     attr = job.get("attribution") or {}
-    return (attr.get(JOB_SCHEMA_VERIFIZIERT_KEY) is True and attr.get("app_id") == SCHEMA_APP_ID
-            and aufrufer_user_id is not None and attr.get("user_id") == aufrufer_user_id)
+    ok = (attr.get(JOB_SCHEMA_VERIFIZIERT_KEY) is True and attr.get("app_id") == SCHEMA_APP_ID
+          and aufrufer_user_id is not None and attr.get("user_id") == aufrufer_user_id)
+    if not ok:
+        logger.warning("privacy anlagenkontext: nicht verifiziert (job-merkmal) — unchanged masking")
+    return ok

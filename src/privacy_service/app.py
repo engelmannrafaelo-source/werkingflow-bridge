@@ -347,6 +347,87 @@ async def smart_anonymize_service_endpoint(req: SmartAnonymizeServiceRequest):
     return result
 
 
+# ======================== Bild-PII-Maske (Bildvertrag v3/v4, Schnittstelle Bild v3) ========================
+
+def bild_antwort(ergebnis, modus: str) -> Dict[str, Any]:
+    """JSON der Schnittstelle (ohne final_token; den stellt die Bridge aus). Keine Texte, nur Kaesten/Zaehler/Bytes."""
+    from src.privacy_image.fehler import API_VERSION
+
+    masken = [{"x": x, "y": y, "w": w, "h": h, "grund": g} for x, y, w, h, g in ergebnis.masken]
+    out: Dict[str, Any] = {
+        "api": API_VERSION, "modus": modus, "eingang_sha256": ergebnis.eingang_sha256,
+        "automaske": {"zeilen": ergebnis.zeilen, "masken": len(masken), "leer": ergebnis.leer, "art": "vorschlag"},
+        "masken": masken,
+    }
+    bild = {"mime": ergebnis.mime, "b64": ergebnis.b64, "breite": ergebnis.breite, "hoehe": ergebnis.hoehe}
+    if modus == "vorschlag":
+        out["vorschau"] = bild
+    else:
+        out["handmasken_angewendet"] = ergebnis.handmasken_angewendet
+        out["modell"] = {**bild, "b64_zeichen": len(bild["b64"]), "bytes": len(ergebnis.bytes_), "sha256": ergebnis.sha256}
+    return out
+
+
+@app.post("/image-mask")
+async def image_mask_endpoint(request: Request):
+    """Automaske + Handmasken auf einem Bild, NUR im Speicher (kein UploadFile-Spool, kein tempfile, keine Logs mit Inhalt).
+
+    Der Koerper wird roh gelesen und mit dem stdlib-Parser zerlegt (src.privacy_image.formular.multipart_teile).
+    Antwort ohne final_token; die Bridge prueft Principal/Flags und stellt das Token aus.
+    """
+    from src.privacy_image import formular as _bf
+    from src.privacy_image.dienst import erkennung_presidio, ocr_rapid
+    from src.privacy_image.fehler import BildFehler
+    from src.privacy_image.verarbeitung import verarbeiten
+
+    kopf = {"Cache-Control": "no-store"}
+    try:
+        laenge = int(request.headers.get("content-length") or 0)
+        if laenge > _bf.MAX_KOERPER_BYTES:
+            raise BildFehler(413, "image_too_large")
+        koerper = b""
+        async for stueck in request.stream():
+            koerper += stueck
+            if len(koerper) > _bf.MAX_KOERPER_BYTES:
+                raise BildFehler(413, "image_too_large")
+        anfrage = _bf.maske_anfrage(_bf.multipart_teile(request.headers.get("content-type", ""), koerper))
+        del koerper
+        erkennen_roh = erkennung_presidio(anfrage.sprache)
+
+        async def erkennen(text: str):
+            try:
+                await asyncio.wait_for(_SMART_ANONYMIZE_SEMAPHORE.acquire(), timeout=_SMART_ANONYMIZE_QUEUE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                raise BildFehler(503, "image_mask_unavailable")
+            try:
+                return await erkennen_roh(text)
+            finally:
+                _SMART_ANONYMIZE_SEMAPHORE.release()
+
+        def ocr(bild):
+            try:
+                return ocr_rapid(bild)
+            except BildFehler:
+                raise
+            except Exception:
+                raise BildFehler(503, "image_mask_unavailable")
+
+        ergebnis = await verarbeiten(
+            modus=anfrage.modus, roh=anfrage.bild, ocr=ocr, erkennung=erkennen,
+            eingang_sha256=anfrage.eingang_sha256, raum=anfrage.raum, handmasken=anfrage.handmasken,
+        )
+    except BildFehler as f:
+        logger.info("image-mask abgewiesen: %s %s", f.status, f.code)
+        return JSONResponse(status_code=f.status, content=f.body(), headers=kopf)
+    except Exception as e:  # nie Ausnahmetext durchreichen (A-BV-2)
+        logger.error("image-mask Fehler: %s", type(e).__name__)
+        return JSONResponse(status_code=503, content=BildFehler(503, "image_mask_unavailable").body(), headers=kopf)
+    logger.info("image-mask %s: zeilen=%d masken=%d hand=%d %dx%d bytes=%d sha=%s", anfrage.modus, ergebnis.zeilen,
+                len(ergebnis.masken), ergebnis.handmasken_angewendet, ergebnis.breite, ergebnis.hoehe,
+                len(ergebnis.bytes_), ergebnis.sha256[:12])
+    return JSONResponse(content=bild_antwort(ergebnis, anfrage.modus), headers=kopf)
+
+
 # ======================== PDF Conversion Endpoint ========================
 
 @app.post("/convert-pdf")

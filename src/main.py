@@ -2902,6 +2902,16 @@ async def chat_completions(
     from fastapi.responses import JSONResponse
     from src import chat_weiterleitung as _cw
 
+    # Bild-PII-Maske (A-W3-1 c): fuer die Schema-App jede Bildform hier pruefen, VOR Stream/Job/Finanzierung.
+    # Ohne Bild: None, der Textweg bleibt unveraendert. Mit Bild: Bindung pruefen, danach §4 fail-closed.
+    from src.routing.app_provider_policy import _resolve_app_id as _bild_app_id
+    if (_bild_app_id(request)[0] == "werking-schema-generator"
+            or (request.headers.get("x-app-id") or "").strip().lower() == "werking-schema-generator"):
+        from src.privacy_image import bridge as _bild_bridge
+        _bild_antwort = await _bild_bridge.chat_pruefen(request)
+        if _bild_antwort is not None:
+            return _bild_antwort
+
     if request_body.provider_fallback is not None:
         # S1: Anbieter-Fallback nur nicht streamend und ohne Bild (Pool-Weg,
         # Direktweg). Frueh und laut statt still ohne Fallback.
@@ -4049,6 +4059,18 @@ async def _chat_completions_lauf(
         # Hinter diesem Punkt liegen ALLE Backend-Zweige (Bedrock, Vertex, anthropic_direct, OpenAI, Gemini, SDK).
         # =======================================================================
         _strict_dispatch = extract_attribution_context(request).get("app_id") == "werking-schema-generator"
+        # Bild-PII-Maske §4 (SEC 18.11.): ein gebundener Bild-Request (chat_pruefen: Receipt/Job/sha/Tenant geprueft) darf
+        # NUR strikt dispatcht auf dem anthropic_direct-Vision-Weg ohne Stream laufen; die drei Schloesser + Modell
+        # prueft der strikte Block unten. Sonst 403, keine Umleitung (src/privacy_image/bridge.py bild_backend_fehler).
+        from src.privacy_image.bridge import bild_backend_fehler as _bild_backend_fehler
+        _bild_bf = _bild_backend_fehler(request, strict=_strict_dispatch,
+                                        backend=(backend_config.backend if backend_config else None),
+                                        stream=bool(request_body.stream))
+        if _bild_bf is not None:
+            raise HTTPException(status_code=403, detail={
+                "error": _bild_bf, "appId": "werking-schema-generator",
+                "message": "Für Bilder ist nur der freigegebene Bildweg zulässig.",
+            })
         if _strict_dispatch:
             # Zugelassen: Bedrock (Ein-Versuch-Client) und Vertex EU (ein einziger httpx-POST, call_vertex_eu), jeweils
             # ohne Stream. Welche der beiden, entscheidet allein der Schema-Guard oben (Operator-Pin).
@@ -10686,6 +10708,29 @@ async def smart_anonymize_endpoint(
         prefix=request_body.prefix,
         known_entities=request_body.known_entities,
     )
+
+
+@app.post("/v1/privacy/image-mask")
+async def privacy_image_mask_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Bild-PII-Maske vorschlag/final (Schnittstelle Bild v3). Schalter BRIDGE_ANONYMIZE_ENABLED und
+    BRIDGE_PRIVACY_IMAGE_MASK (Standard aus -> 404). Body roh, nur im Speicher; siehe src/privacy_image/bridge.py."""
+    await verify_api_key(request, credentials)
+    from src.privacy_image import bridge as _bild_bridge
+    return await _bild_bridge.image_mask(request, get_privacy_client(), privacy_timeout)
+
+
+@app.post("/v1/privacy/image-receipt")
+async def privacy_image_receipt_endpoint(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Receipt fuer die bestaetigte Modellfassung (Schnittstelle Bild v3 §2). Ein final_token = ein Receipt."""
+    await verify_api_key(request, credentials)
+    from src.privacy_image import bridge as _bild_bridge
+    return await _bild_bridge.image_receipt(request)
 
 
 # ============================================================================

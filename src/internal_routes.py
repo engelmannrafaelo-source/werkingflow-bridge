@@ -744,6 +744,8 @@ class InternalJobCreateIdempotent(InternalJobCreate):
     sees anything else."""
     idempotency_owner: str = Field(min_length=1, max_length=400)
     idempotency_key: str = Field(min_length=1, max_length=200)
+    # Bild-PII-Maske: Receipt-Verbrauch in derselben Transaktion (Bildvertrag v3 §2.2); None = bisheriges Verhalten.
+    bild: Optional[Dict[str, Any]] = None
 
 
 class InternalJobProgress(BaseModel):
@@ -885,12 +887,15 @@ async def internal_create_job_idempotent(
     from before BRREF2 answers 405 (the path matches GET /jobs/{job_id}) —
     the worker treats that as "cannot honour the key", never as created."""
     from src.jobs import store
+    from src.privacy_image.fehler import BildFehler
 
     try:
         return await store.create_job_idempotent(
             body.job_id, body.kind, body.payload, body.attribution,
-            body.idempotency_owner, body.idempotency_key,
+            body.idempotency_owner, body.idempotency_key, bild=body.bild,
         )
+    except BildFehler as e:
+        raise HTTPException(status_code=e.status, detail={"reason": "bild", "code": e.code})
     except store.IdempotencyKeyReused as e:
         raise HTTPException(
             status_code=409,
@@ -1136,3 +1141,52 @@ async def internal_prune_jobs(
     from src.jobs import store
 
     return await store.prune_jobs(body.terminal_ttl_seconds, body.max_age_seconds)
+
+
+# ── Bild-PII-Maske: Receipts (Bildvertrag v3 §2.1, Schnittstelle Bild v3 §2; c9a50d3b) ──────────────────────────
+class InternalBildReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    token_hash: str = Field(min_length=64, max_length=64)
+    felder: Dict[str, Any]
+    app_id: str = Field(min_length=1, max_length=100)
+    bestaetigung_version: str = Field(min_length=1, max_length=20)
+    bestaetigt_um: str
+
+
+@router.post("/privacy-image/receipts", status_code=201)
+async def internal_bild_receipt_anlegen(
+    body: InternalBildReceipt,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Any:
+    """Receipt anlegen (nur Metadaten). token_hash UNIQUE: zweites Einloesen -> 409 detail.reason=bild."""
+    from datetime import datetime
+    from src.db.client import get_pool
+    from src.privacy_image import speicher
+    from src.privacy_image.fehler import BildFehler
+
+    try:
+        um = datetime.fromisoformat(body.bestaetigt_um)
+        async with get_pool().acquire() as conn:
+            r = await speicher.receipt_anlegen(conn, token_hash=body.token_hash, felder=body.felder,
+                                               app_id=body.app_id, bestaetigung_version=body.bestaetigung_version,
+                                               bestaetigt_um=um)
+    except BildFehler as e:
+        raise HTTPException(status_code=e.status, detail={"reason": "bild", "code": e.code})
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(status_code=422, detail={"reason": "bild", "code": "image_field_unknown"})
+    return {**r, "expires_at": r["expires_at"].isoformat()}
+
+
+@router.get("/privacy-image/receipts/by-job/{job_id}")
+async def internal_bild_receipt_fuer_job(
+    job_id: str,
+    _claims: AuthClaims = Depends(require_service_token),
+) -> Any:
+    from src.db.client import get_pool
+    from src.privacy_image import speicher
+
+    async with get_pool().acquire() as conn:
+        r = await speicher.receipt_fuer_job(conn, job_id)
+    if r is None:
+        raise HTTPException(status_code=404, detail="kein Receipt fuer diesen Job")
+    return r

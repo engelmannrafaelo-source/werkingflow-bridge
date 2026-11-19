@@ -115,6 +115,15 @@ converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(p
 print('Docling models downloaded successfully') \
 " || echo "WARNING: Docling model pre-download failed (will download on first use)"
 
+# Bild-PII-Maske (src/privacy_image/dienst.py, Container 8104): die eigenstaendige RapidOCR-Engine laedt ihre
+# onnx-Modelle sonst beim ersten Bild aus dem Netz. Hier einmal beim Bau, damit der Dienst zur Laufzeit ohne
+# Netz arbeitet. Bewusst OHNE "|| echo": ohne Modelle ist der Bild-Dienst unbrauchbar -> Bau scheitert laut.
+RUN poetry run python -c "\
+import numpy as np; \
+from rapidocr import RapidOCR; \
+RapidOCR()(np.full((64, 256, 3), 255, dtype='uint8')); \
+print('RapidOCR models ready')"
+
 # Playwright + Chromium für den HTML→PDF-Renderer (/convert-html-to-pdf).
 # Per pip installiert (NICHT via poetry), um die committete poetry.lock NICHT
 # neu aufzulösen — ein `poetry lock` hat docling/torch schon auf einen kaputten

@@ -1,0 +1,44 @@
+# Bild-Privacy-Dienst (Bild-PII-Maske, OCR) — eigener Container NEBEN dem geteilten Text-Privacy-Dienst (8100).
+# SEC 18.11.2026: bestehender Host gpu-privacy-1, Port 8104, 8100 bleibt unveraendert. Bereitstellung: Root mit dem
+# GPU-Betriebsowner (nicht der Bridge-Writer). Gebaut aus genau dem Kandidaten-Commit (GIT_COMMIT), gleiches Dockerfile
+# wie der Text-Dienst; der Container bedient nur die Bridge (Bild-Weg /image-mask).
+#
+# Aufruf auf gpu-privacy-1 (Beispiel, Root):
+#   GIT_COMMIT=<sha> PRIVACY_IMAGE_BIND=100.65.149.39 \
+#     docker compose -p privacy-image -f docker/docker-compose-privacy-image.yml --env-file /root/privacy-image.env up -d --build
+# /root/privacy-image.env (root 0600, aus Infisical ueber den Credential-Owner): PRIVACY_IMAGE_SERVICE_TOKEN=<>=32 Zeichen>
+#
+# Grenzen: nur an die Tailnet-Adresse gebunden (nicht 0.0.0.0); Zugriff zusaetzlich per Host-Filter nur fuer die
+# Bridge-Worker (Dev 100.112.98.39 / 49.12.72.66-Worker, Prod-Worker-Host 100.93.143.105) — Root.
+# Rollback: `docker compose -p privacy-image … down` entfernt NUR diesen Container; 8100 ist nie beteiligt.
+services:
+  privacy-image:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.privacy-pdf
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:?GIT_COMMIT (Kandidaten-sha) fehlt}
+        TORCH_VARIANT: cpu
+    image: werking-privacy-image:${GIT_COMMIT:?GIT_COMMIT fehlt}
+    container_name: privacy-image-8104
+    restart: unless-stopped
+    ports:
+      - "${PRIVACY_IMAGE_BIND:?PRIVACY_IMAGE_BIND (Tailnet-IP) fehlt}:8104:8100"
+    environment:
+      # Eigenes Token NUR fuer den Bild-Weg (Bridge: PRIVACY_IMAGE_SERVICE_TOKEN); nicht das Text-Token von 8100.
+      PRIVACY_SERVICE_TOKEN: ${PRIVACY_IMAGE_SERVICE_TOKEN:?PRIVACY_IMAGE_SERVICE_TOKEN fehlt}
+      PRIVACY_TOKEN_PFLICHT: alle
+      UVICORN_WORKERS: "1"
+      # Kein ANTHROPIC_*-Schluessel: der Bild-Dienst ruft kein Modell (nur OCR + Presidio lokal). Modell-Caches wie
+      # beim Text-Dienst aus dem Image (Flair/spaCy/Docling/RapidOCR vorab geladen); keine abweichenden Offline-Schalter.
+    mem_limit: 8g
+    cpus: 4
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}

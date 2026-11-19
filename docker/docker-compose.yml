@@ -264,6 +264,10 @@ services:
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - PRIVACY_SERVICE_TOKEN=${PRIVACY_SERVICE_TOKEN:-}
+      # Bildweg (SEC 18.11.): Werte aus docker/.env (sync-infisical-to-bridge, nur dev-Bridge).
+      # environment schlaegt env_file: Werte in secrets/platform.env wuerden hier ueberschattet.
+      - BRIDGE_PRIVACY_IMAGE_TOKEN_SECRET=${BRIDGE_PRIVACY_IMAGE_TOKEN_SECRET:-}
+      - PRIVACY_IMAGE_SERVICE_TOKEN=${PRIVACY_IMAGE_SERVICE_TOKEN:-}
       - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
@@ -479,6 +483,10 @@ services:
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - PRIVACY_SERVICE_TOKEN=${PRIVACY_SERVICE_TOKEN:-}
+      # Bildweg (SEC 18.11.): Werte aus docker/.env (sync-infisical-to-bridge, nur dev-Bridge).
+      # environment schlaegt env_file: Werte in secrets/platform.env wuerden hier ueberschattet.
+      - BRIDGE_PRIVACY_IMAGE_TOKEN_SECRET=${BRIDGE_PRIVACY_IMAGE_TOKEN_SECRET:-}
+      - PRIVACY_IMAGE_SERVICE_TOKEN=${PRIVACY_IMAGE_SERVICE_TOKEN:-}
       - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
@@ -694,6 +702,10 @@ services:
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - PRIVACY_SERVICE_TOKEN=${PRIVACY_SERVICE_TOKEN:-}
+      # Bildweg (SEC 18.11.): Werte aus docker/.env (sync-infisical-to-bridge, nur dev-Bridge).
+      # environment schlaegt env_file: Werte in secrets/platform.env wuerden hier ueberschattet.
+      - BRIDGE_PRIVACY_IMAGE_TOKEN_SECRET=${BRIDGE_PRIVACY_IMAGE_TOKEN_SECRET:-}
+      - PRIVACY_IMAGE_SERVICE_TOKEN=${PRIVACY_IMAGE_SERVICE_TOKEN:-}
       - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:
@@ -910,6 +922,10 @@ services:
       - DEFAULT_PRIVACY_MODE=none
       - PRIVACY_SERVICE_URL=${PRIVACY_SERVICE_URL:-http://100.65.149.39:8100}
       - PRIVACY_SERVICE_TOKEN=${PRIVACY_SERVICE_TOKEN:-}
+      # Bildweg (SEC 18.11.): Werte aus docker/.env (sync-infisical-to-bridge, nur dev-Bridge).
+      # environment schlaegt env_file: Werte in secrets/platform.env wuerden hier ueberschattet.
+      - BRIDGE_PRIVACY_IMAGE_TOKEN_SECRET=${BRIDGE_PRIVACY_IMAGE_TOKEN_SECRET:-}
+      - PRIVACY_IMAGE_SERVICE_TOKEN=${PRIVACY_IMAGE_SERVICE_TOKEN:-}
       - PRIVACY_SERVICE_FALLBACK_URL=${PRIVACY_SERVICE_FALLBACK_URL:-}
       - AI_BRIDGE_URL_PROD_FALLBACK=${AI_BRIDGE_URL_PROD_FALLBACK:-}
     healthcheck:

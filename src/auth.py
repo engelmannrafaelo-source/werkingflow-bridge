@@ -546,6 +546,16 @@ def _is_job_path(path: Optional[str]) -> bool:
     return path == "/v1/jobs" or (path or "").startswith("/v1/jobs/")
 
 
+#: Bildweg der Homepage (Kanzler 19.11.2026): ein wsg_-Schluessel darf ausser den Job-Pfaden GENAU diese zwei
+#: Routen per POST rufen. Sie haben einen eigenen Principal-Zaun (src/privacy_image/bridge.py _zaun) und eigene
+#: Schalter; ohne diese Ausnahme antwortete jeder neu angelegte Schema-Principal dort 403.
+WSG_BILDROUTEN = frozenset({"/v1/privacy/image-mask", "/v1/privacy/image-receipt"})
+
+
+def _wsg_pfad_erlaubt(method: Optional[str], path: Optional[str]) -> bool:
+    return _is_job_path(path) or ((method or "").upper() == "POST" and path in WSG_BILDROUTEN)
+
+
 async def verify_api_key(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = None):
     """
     Verify API key if one is configured for FastAPI endpoint protection.
@@ -558,10 +568,10 @@ async def verify_api_key(request: Request, credentials: Optional[HTTPAuthorizati
     if credentials is None:
         credentials = await security(request)
     if (credentials and (credentials.credentials or "").startswith(SCHEMA_TOKEN_PREFIX)
-            and not _is_job_path(request.url.path)):
+            and not _wsg_pfad_erlaubt(request.method, request.url.path)):
         raise HTTPException(
             status_code=403,
-            detail="schema key may only call /v1/jobs",
+            detail="schema key may only call /v1/jobs and POST /v1/privacy/image-mask|image-receipt",
         )
 
     # Get the active API key (environment or runtime-generated)

@@ -24,6 +24,20 @@ Prints one JSON line per target and a summary line. Exit code:
   3  no active job, but at least one target lacks the endpoint (HTTP 404, an
      image from before BR8). Only an explicit introduction switch may accept
      this, because the gate cannot see that target at all.
+  4  everything asked from here is idle, but at least one peer was named with
+     ``--peer-remote`` and is NOT asked from here (P1, see below). This is NOT
+     a release: the caller must ask that peer's store from the peer's own side
+     (scripts/platform_api_job_gate_heimat.py) and only an idle answer there
+     completes the proof.
+
+"busy" means active > 0 OR waiting > 0 (SEC 18.11.2026): a parked job with a
+running wait still depends on its home platform-api the moment the wait ends.
+
+--peer-remote NAME[,NAME] (P1, SEC 18.11.2026): the named peers are asked from
+their own side with their own credential, so no peer credential has to live on
+this bridge. Every named peer must exist in FEDERATION_PEERS (exact, else rc 2);
+peers NOT named are asked from here exactly as before. Naming a peer never
+releases anything by itself — it turns the answer into rc 4 at best.
 """
 from __future__ import annotations
 
@@ -53,22 +67,42 @@ def _ask(base_url: str, token: str, origin: str | None) -> dict:
         return {"state": "error", "detail": f"HTTP {e.code}"}
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
         return {"state": "error", "detail": f"{type(e).__name__}: {e}"}
-    if not isinstance(body, dict) or not isinstance(body.get("active"), int):
-        return {"state": "error", "detail": "answer without an 'active' count"}
+    if not isinstance(body, dict) or type(body.get("active")) is not int \
+            or type(body.get("waiting")) is not int or body["active"] < 0 or body["waiting"] < 0:
+        return {"state": "error", "detail": "answer without valid 'active'/'waiting' counts"}
     jobs = [
         f"{j.get('job_id')}({j.get('kind')},{j.get('status')},origin={j.get('origin')})"
         for j in body.get("jobs") or []
         if isinstance(j, dict)
     ]
     return {
-        "state": "busy" if body["active"] > 0 else "idle",
+        "state": "busy" if body["active"] > 0 or body["waiting"] > 0 else "idle",
         "active": body["active"],
         "waiting": body.get("waiting"),
-        "jobs": jobs[: body["active"]],
+        "jobs": jobs[: body["active"] + body["waiting"]],
     }
 
 
-def main() -> int:
+def _peer_remote(argv: list) -> set | None:
+    """Parse --peer-remote NAME[,NAME]. None = malformed arguments."""
+    remote: set = set()
+    i = 0
+    while i < len(argv):
+        if argv[i] != "--peer-remote" or i + 1 >= len(argv):
+            return None
+        names = [n.strip().lower() for n in argv[i + 1].split(",")]
+        if not all(names):
+            return None
+        remote.update(names)
+        i += 2
+    return remote
+
+
+def main(argv: list | None = None) -> int:
+    remote = _peer_remote(sys.argv[1:] if argv is None else argv)
+    if remote is None:
+        print(json.dumps({"target": "self", "state": "error", "detail": "bad arguments"}))
+        return 2
     own = os.getenv("BRIDGE_ORIGIN_ID", "").strip().lower()
     token = os.getenv("BRIDGE_SERVICE_TOKEN", "")
     if not own or not token:
@@ -94,7 +128,20 @@ def main() -> int:
         print(json.dumps({"target": "peers", "state": "error",
                           "detail": "FEDERATION_PEERS is not a JSON object"}))
         return 2
+    peers = {str(k).strip().lower(): v for k, v in peers.items()}
+    unknown = sorted(remote - set(peers))
+    if unknown:
+        print(json.dumps({"target": "peers", "state": "error",
+                          "detail": f"--peer-remote names no configured peer: {unknown}"}))
+        return 2
+    remote_lines = []
     for name, peer in sorted(peers.items()):
+        if name in remote:
+            # Asked from the peer's own side (P1). Not looked at here at all:
+            # neither its URL nor its token (which may be absent on purpose).
+            remote_lines.append({"target": f"peer:{name}", "state": "remote", "origin": own,
+                                 "detail": "asked from the peer's own side (platform_api_job_gate_heimat.py)"})
+            continue
         url = peer.get("platformUrl") if isinstance(peer, dict) else None
         peer_token = os.getenv(peer.get("tokenEnv") or "", "") if isinstance(peer, dict) else ""
         if not url or not peer_token:
@@ -122,6 +169,9 @@ def main() -> int:
         print(json.dumps(result, sort_keys=True))
         states.append(result["state"])
 
+    for line in remote_lines:
+        print(json.dumps(line, sort_keys=True))
+        states.append(line["state"])
     print(json.dumps({"summary": True, "own_origin": own, "states": states}))
     if "error" in states:
         return 2
@@ -129,6 +179,8 @@ def main() -> int:
         return 1
     if "missing" in states:
         return 3
+    if "remote" in states:
+        return 4
     return 0
 
 
