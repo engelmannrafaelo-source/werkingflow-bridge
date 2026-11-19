@@ -691,6 +691,12 @@ async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:
     (dependency/capacity), and that run booked its own call like any run that
     ends. It gets ``progress.abbruch.ledger = 'vom_lauf'`` so DELETE does not
     read the row as never worked on (FK25BR R4).
+
+    Only a 'running' row is touched: parking is the act of the run that holds
+    it. A row that is already terminal (done/error/cancelled) or still
+    'pending' stays exactly as it is, so a late or stray call (internal route,
+    store_client) can never bring a finished job back to 'pending' and have a
+    watchdog run and bill it again (Review e8511fe6, 19.11.2026).
     """
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -713,7 +719,7 @@ async def defer_job(job_id: str, delay_seconds: int, reason: str) -> None:
                    defer_reason = $3,
                    heartbeat_at = NOW(),
                    updated_at = NOW()
-             WHERE job_id = $1
+             WHERE job_id = $1 AND status = 'running'
             """,
             job_id,
             str(delay_seconds),
