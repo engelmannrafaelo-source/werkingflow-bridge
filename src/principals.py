@@ -71,8 +71,12 @@ class Principal:
         return app_id in self.allowed_apps
 
     def may_use_path(self, path: Optional[str]) -> bool:
-        if not self.allowed_paths or WILDCARD in self.allowed_paths:
+        # Leere Liste = ZU (Kanzler 18.11.2026): nur der Joker "*" oeffnet alles. Frueher galt [] als "alles erlaubt" —
+        # ein Principal ohne einen einzigen freigegebenen Pfad durfte damit jeden Pfad nutzen.
+        if WILDCARD in self.allowed_paths:
             return True
+        if not self.allowed_paths:
+            return False
         if path is None:
             return False
         if path in self.allowed_paths:
@@ -143,12 +147,19 @@ def invalidate_cache() -> None:
     _cache.clear()
 
 
+def _paths_aus_db(wert) -> List[str]:
+    """allowed_paths aus DB/platform-api. Nur NULL (Spalte ist NOT NULL DEFAULT '{*}', also nur Altpfade) wird zum
+    Joker; eine leere Liste bleibt leer und heisst damit ZU (may_use_path). Frueher machte `or [WILDCARD]` aus []
+    still einen Voll-Joker."""
+    return [WILDCARD] if wert is None else list(wert)
+
+
 def _row_to_principal(row) -> Principal:
     return Principal(
         id=str(row["id"]),
         name=row["name"],
         allowed_apps=list(row["allowed_apps"] or []),
-        allowed_paths=list(row["allowed_paths"] or [WILDCARD]),
+        allowed_paths=_paths_aus_db(row["allowed_paths"]),
         monthly_cap_eur=float(row["monthly_cap_eur"]) if row["monthly_cap_eur"] is not None else None,
     )
 
@@ -161,7 +172,7 @@ def _dict_to_principal(data: dict) -> Principal:
         id=str(data["id"]),
         name=data["name"],
         allowed_apps=list(data.get("allowed_apps") or []),
-        allowed_paths=list(data.get("allowed_paths") or [WILDCARD]),
+        allowed_paths=_paths_aus_db(data.get("allowed_paths")),
         monthly_cap_eur=float(data["monthly_cap_eur"]) if data.get("monthly_cap_eur") is not None else None,
     )
 
@@ -187,7 +198,7 @@ async def get_principal_row_by_hash(token_hash: str) -> Optional[dict]:
         "id": str(row["id"]),
         "name": row["name"],
         "allowed_apps": list(row["allowed_apps"] or []),
-        "allowed_paths": list(row["allowed_paths"] or [WILDCARD]),
+        "allowed_paths": _paths_aus_db(row["allowed_paths"]),
         "monthly_cap_eur": float(row["monthly_cap_eur"]) if row["monthly_cap_eur"] is not None else None,
     }
 
@@ -258,6 +269,10 @@ async def create_principal(
 ) -> Principal:
     """Insert a new principal. The cleartext token is provided by the route (it
     generates + returns it once); here we store only the hash + prefix."""
+    if allowed_paths is not None and len(allowed_paths) == 0:
+        # Eine leere Liste waere seit 18.11.2026 "zu" (may_use_path) — ein Principal ohne Pfad ist ein Fehler des
+        # Aufrufers, nicht ein stiller Ausschluss. Die Route antwortet vorher schon 422.
+        raise ValueError("allowed_paths must not be empty (use ['*'] or explicit paths)")
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
