@@ -45,7 +45,8 @@ PERIOD_DAYS = 30
 #: grosse Anlagen ab, Analyse 09.11.2026). Kanzler-Entscheid 17.11.2026 nach Weg-A-Pruefung R1 (K2).
 #: G-5 (19.11.2026, Rafael ueber Kanzler): 32000 — mit 16000 endeten grosse Textanlagen (7 Unterlagen) samt Denken
 #: zweimal mit finish_reason != stop. Wirkt erst, wenn der Client ebenfalls mehr als 16000 anfragt (min-Regel).
-MAX_TOKENS_CAP = 32000
+#: G-7 (19.11.2026, Rafael ueber Kanzler „Deckel auf 128k“): 128000; ersetzt den G-5-Wert.
+MAX_TOKENS_CAP = 128000
 
 
 @dataclass
