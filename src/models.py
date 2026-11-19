@@ -825,9 +825,10 @@ class ResearchResponse(ErrorVerdictFields):
     # Beobachtbarkeit pro Lauf: macht Tool-Nutzung pruefbar (Eval/Abnahme),
     # statt sie aus dem Report-Text erraten zu muessen.
     #
-    # web_searches/web_fetches zaehlt nur der Cloud-Executor — auf dem
-    # Worker-Pool-Pfad fuehrt die CLI die Suche selbst und meldet keine
-    # Aufrufzahl zurueck, dort bleiben sie None.
+    # web_searches/web_fetches fuellen BEIDE Wege (Pool seit 19.11.2026,
+    # research_qualitaet: gezaehlt aus den ToolUse-Bloecken der CLI). Zaehlweise
+    # verschieden: Pool-web_fetches enthaelt fetch_document, der Cloud-Weg fuehrt
+    # es getrennt in dokument_abrufe.
     # library_calls fuellen BEIDE Wege (seit 07.09.2026, Karte k20): der Cloud-
     # Weg zaehlt library_index/library_get, der Pool-Weg die Read/Grep/Glob-
     # Zugriffe auf den Bibliotheksordner im Arbeitsverzeichnis. None heisst
@@ -835,11 +836,18 @@ class ResearchResponse(ErrorVerdictFields):
     # anderes als 0 ("stand bereit, wurde nicht gebraucht").
     web_searches: Optional[int] = Field(
         default=None,
-        description="research-cloud only: number of web_search tool calls in this run"
+        description=(
+            "number of web search tool calls in this run (research-cloud: web_search; "
+            "worker pool: WebSearch/perplexity_search ToolUse blocks). Attempts, not results"
+        )
     )
     web_fetches: Optional[int] = Field(
         default=None,
-        description="research-cloud only: number of web_fetch tool calls in this run"
+        description=(
+            "number of fetch tool calls in this run (attempts, incl. failed ones). "
+            "research-cloud: web_fetch only (fetch_document is in dokument_abrufe); "
+            "worker pool: WebFetch AND fetch_document. Read sources: qualitaet.erreicht.fetches_ok"
+        )
     )
     dokument_abrufe: Optional[int] = Field(
         default=None,
@@ -924,7 +932,9 @@ class ResearchResponse(ErrorVerdictFields):
             "Measured research quality (research_qualitaet): erreicht {suchen, fetches_versucht, "
             "fetches_ok, quellen_gelesen, domains, hops} from the run's tool calls, soll (lower "
             "bounds of deep/exhaustive), status nicht_anwendbar|erfuellt|teilweise|unbekannt, grund, "
-            "pflicht, pfad, bibliothek. Unknown values are null with a reason, never 0."
+            "pflicht, pfad, bibliothek, leseurteil {nicht_gelesen per reason is_error|umleitung|"
+            "fehlseite|kurz, ohne_urteil, laengen classes, schwelle_zeichen} (counters only). "
+            "domains = registrable domains (eTLD+1). Unknown values are null with a reason, never 0."
         ),
     )
     nachkontrolle: Optional[Dict[str, Any]] = Field(

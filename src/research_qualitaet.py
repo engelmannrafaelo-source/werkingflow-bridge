@@ -13,10 +13,15 @@ Measurement (DQ-1, Kanzler 19.11.: variant (a) plus a content signal):
   ``is_error`` AND carries a content signal judged here in the worker: enough
   text, no redirect notice, no error/not-found page. The content itself is
   never kept or passed on — only the verdict (see ``ergebnis_eintrag``).
-* ``domains``: distinct hosts of the read fetches, taken from the ToolUse
-  ``input.url`` (a redirect counts as the URL that was asked for).
+* ``domains``: distinct REGISTRABLE domains (eTLD+1) of the read fetches, taken
+  from the ToolUse ``input.url`` (a redirect counts as the URL that was asked for);
+  subdomains of one site count once (DQ-R2, Review e8511fe6).
 * ``hops``: rounds "search(es) -> at least one read fetch"; a search issued
   AFTER a read fetch opens the next round. Only rounds with a read fetch count.
+* ``leseurteil`` (DQ-R1): counters only — not-read fetches per reason
+  (is_error | umleitung | fehlseite | kurz), fetches without a verdict, and a length
+  class per non-error result. They make the read verdict traceable and calibrate
+  threshold and markers in the live acceptance; no content leaves the worker.
 Unknown stays ``None`` with a reason — never 0, and under the quality duty never
 a pass (DQ-5).
 
@@ -36,8 +41,19 @@ UNTERGRENZEN: Dict[str, Dict[str, int]] = {
 }
 
 #: Content signal for a read page: shorter extractions are no read source.
+#: Provisional (DQ-R1): WebFetch returns the model's SUMMARY of the page, which can be
+#: short on a real read; 300 is confirmed only after the live acceptance R15-R17 reports
+#: the length classes below.
 MIN_ZEICHEN_GELESEN = 300
-_UMLEITUNG = ("redirect detected", "redirected to", "the url redirected", "weiterleitung")
+#: WebFetch's own redirect notice only (DQ-R1: "weiterleitung" hit real German content
+#: like "Anrufweiterleitung einrichten"; "redirected to" hits ordinary prose). Checked
+#: at the START of the result, where the tool puts its notice.
+_UMLEITUNG = ("redirect detected",)
+_UMLEITUNG_KOPF = 120
+#: Length classes for calibration (counters only), upper bounds exclusive.
+LAENGEN_KLASSEN = ((150, "unter_150"), (300, "150_299"), (1000, "300_999"))
+LAENGE_GROSS = "ab_1000"
+GRUENDE_NICHT_GELESEN = ("is_error", "umleitung", "fehlseite", "kurz")
 _FEHLSEITE = ("404 not found", "page not found", "error 404", "403 forbidden", "access denied",
               "failed to fetch", "unable to fetch", "could not fetch")
 
@@ -70,22 +86,38 @@ def _ergebnis_text(inhalt: Any) -> str:
     return "\n".join(teile)
 
 
+def _laengen_klasse(n: int) -> str:
+    for grenze, name in LAENGEN_KLASSEN:
+        if n < grenze:
+            return name
+    return LAENGE_GROSS
+
+
 def ergebnis_eintrag(block: Any) -> Optional[Dict[str, Any]]:
-    """Verdict of ONE ToolResult block: {tool_use_id, is_error, gelesen}. The text is
-    read here and dropped — nothing of the content leaves this function."""
+    """Verdict of ONE ToolResult block: {tool_use_id, is_error, gelesen, grund, laenge}.
+    grund (DQ-R1): None when read, else the FIRST failing check in the order
+    is_error, umleitung, fehlseite, kurz. laenge is a class, never the text. The text
+    is read here and dropped — nothing of the content leaves this function."""
     tid = _attr(block, "tool_use_id")
     if not tid:
         return None
     is_error = bool(_attr(block, "is_error"))
     text = _ergebnis_text(_attr(block, "content"))
-    kopf = text[:600].lower()
-    gelesen = (
-        not is_error
-        and len(text.strip()) >= MIN_ZEICHEN_GELESEN
-        and not any(m in kopf for m in _UMLEITUNG)
-        and not any(m in kopf for m in _FEHLSEITE)
-    )
-    return {"tool_use_id": str(tid), "is_error": is_error, "gelesen": gelesen}
+    rumpf = text.strip()
+    kopf = rumpf[:600].lower()
+    grund: Optional[str]
+    if is_error:
+        grund = "is_error"
+    elif any(m in kopf[:_UMLEITUNG_KOPF] for m in _UMLEITUNG):
+        grund = "umleitung"
+    elif any(m in kopf for m in _FEHLSEITE):
+        grund = "fehlseite"
+    elif len(rumpf) < MIN_ZEICHEN_GELESEN:
+        grund = "kurz"
+    else:
+        grund = None
+    return {"tool_use_id": str(tid), "is_error": is_error, "gelesen": grund is None,
+            "grund": grund, "laenge": None if is_error else _laengen_klasse(len(rumpf))}
 
 
 def ergebnisse_aus_turn(message: Any) -> List[Dict[str, Any]]:
@@ -102,6 +134,22 @@ def ergebnisse_aus_turn(message: Any) -> List[Dict[str, Any]]:
     return out
 
 
+#: Second-level public suffixes (DQ-R2): without a public-suffix list the registrable
+#: domain is the last two labels, or the last three under one of these.
+_SUFFIX_ZWEISTUFIG = frozenset({
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "ltd.uk", "plc.uk", "me.uk", "net.uk", "nhs.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au",
+    "co.at", "or.at", "ac.at", "gv.at",
+    "co.nz", "org.nz", "govt.nz", "ac.nz",
+    "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
+    "com.br", "org.br", "gov.br", "com.cn", "org.cn", "gov.cn", "edu.cn",
+    "co.za", "org.za", "gov.za", "co.in", "org.in", "gov.in", "ac.in",
+    "com.tr", "gov.tr", "com.mx", "gob.mx", "com.ar", "com.sg", "gov.sg", "com.hk",
+    "co.kr", "or.kr", "go.kr", "com.tw", "gov.tw", "co.il", "gov.il", "ac.il",
+    "eu.int", "europa.eu",
+})
+
+
 def _host(url: Any) -> Optional[str]:
     try:
         h = urlsplit(str(url or "")).hostname
@@ -109,7 +157,21 @@ def _host(url: Any) -> Optional[str]:
         return None
     if not h:
         return None
-    return h[4:] if h.startswith("www.") else h
+    return h.rstrip(".").lower() or None
+
+
+def _domain(url: Any) -> Optional[str]:
+    """Registrable domain (eTLD+1) of a URL; IP addresses stay whole (DQ-R2)."""
+    h = _host(url)
+    if not h:
+        return None
+    if ":" in h or h.replace(".", "").isdigit():
+        return h
+    labels = h.split(".")
+    if len(labels) <= 2:
+        return h
+    n = 3 if ".".join(labels[-2:]) in _SUFFIX_ZWEISTUFIG else 2
+    return ".".join(labels[-n:])
 
 
 @dataclass
@@ -121,6 +183,19 @@ class Messung:
     domains: Optional[int] = 0
     hops: Optional[int] = 0
     gruende_unbekannt: List[str] = field(default_factory=list)
+    #: DQ-R1 counters (no content): not-read fetches per reason, fetches whose result
+    #: never arrived, length class per non-error result.
+    nicht_gelesen: Dict[str, int] = field(default_factory=dict)
+    ohne_urteil: int = 0
+    laengen: Dict[str, int] = field(default_factory=dict)
+
+    def leseurteil(self) -> Dict[str, Any]:
+        return {
+            "nicht_gelesen": {g: self.nicht_gelesen.get(g, 0) for g in GRUENDE_NICHT_GELESEN},
+            "ohne_urteil": self.ohne_urteil,
+            "laengen": dict(self.laengen),
+            "schwelle_zeichen": MIN_ZEICHEN_GELESEN,
+        }
 
     def als_dict(self) -> Dict[str, Any]:
         return {
@@ -163,6 +238,13 @@ def messen(chunks: Iterable[Any], ergebnisse: Optional[List[Dict[str, Any]]]) ->
         elif _ist_fetch(name):
             m.fetches_versucht += 1
             e = urteil.get(str(_attr(block, "id") or ""))
+            if e is None:
+                m.ohne_urteil += 1
+            else:
+                if e.get("laenge"):
+                    m.laengen[e["laenge"]] = m.laengen.get(e["laenge"], 0) + 1
+                if not e["gelesen"] and e.get("grund"):
+                    m.nicht_gelesen[e["grund"]] = m.nicht_gelesen.get(e["grund"], 0) + 1
             if e is not None and e["gelesen"]:
                 url = eingabe.get("url") if isinstance(eingabe, dict) else None
                 gelesen_urls.append(str(url or ""))
@@ -175,7 +257,7 @@ def messen(chunks: Iterable[Any], ergebnisse: Optional[List[Dict[str, Any]]]) ->
         return m
     m.fetches_ok = len(gelesen_urls)
     m.quellen_gelesen = len({u for u in gelesen_urls if u})
-    m.domains = len({h for h in (_host(u) for u in gelesen_urls) if h})
+    m.domains = len({d for d in (_domain(u) for u in gelesen_urls) if d})
     m.hops = runden_mit_lesen
     return m
 
@@ -186,7 +268,9 @@ def bewerten(messung: Messung, depth: Optional[str], *, pflicht: bool, pfad: str
     block: Dict[str, Any] = {
         "pfad": pfad, "tiefe": depth, "pflicht": bool(pflicht),
         "erreicht": messung.als_dict(), "soll": dict(soll) if soll else None,
-        "messart": "ToolUse + ToolResult (is_error + Inhaltssignal), Domains/Hops aus angefragten URLs",
+        "messart": ("ToolUse + ToolResult (is_error + Inhaltssignal), Domains = registrierbare "
+                    "Domains (eTLD+1) und Hops aus angefragten URLs"),
+        "leseurteil": None if messung.fetches_ok is None else messung.leseurteil(),
     }
     if not soll:
         block.update(status="nicht_anwendbar", grund=None)
