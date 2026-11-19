@@ -25,21 +25,61 @@ def _rapidocr():
         return _engine
 
 
+def _woerter(zeile: OcrZeile, worte) -> Optional[Tuple[Tuple[int, int, int, int, int, int], ...]]:
+    """Wortboxen einer Zeile mit Offsets im Zeilentext - nur bei belegter Zuordnung, sonst None (Aufrufer: unsicher).
+
+    Belegt heisst: jedes Wort ist in Reihenfolge im Zeilentext auffindbar UND seine Box liegt in der Zeilenbox
+    (Toleranz 1/2 Zeilenhoehe). Sonst koennten Wortlisten verschiedener Zeilen vertauscht sein (RapidOCR filtert
+    word_results getrennt von boxes)."""
+    if not worte:
+        return None
+    tol = max(2.0, 0.5 * (zeile.y1 - zeile.y0))
+    aus = []
+    cursor = 0
+    for wort in worte:
+        try:
+            txt, _score, box = wort
+            xs = [float(p[0]) for p in box]
+            ys = [float(p[1]) for p in box]
+        except (TypeError, ValueError, IndexError):
+            return None
+        txt = str(txt)
+        if not txt.strip():
+            continue
+        start = zeile.text.find(txt, cursor)
+        if start < 0:
+            return None
+        x0, y0, x1, y1 = int(min(xs)), int(min(ys)), int(max(xs) + 0.999), int(max(ys) + 0.999)
+        if x0 < zeile.x0 - tol or y0 < zeile.y0 - tol or x1 > zeile.x1 + tol or y1 > zeile.y1 + tol or x1 <= x0 or y1 <= y0:
+            return None
+        aus.append((x0, y0, x1, y1, start, start + len(txt)))
+        cursor = start + len(txt)
+    return tuple(aus) or None
+
+
 def ocr_rapid(bild) -> Sequence[OcrZeile]:
-    """RGB-PIL-Bild -> Zeilen (achsparalleles Rechteck um das OCR-Viereck), Reihenfolge wie RapidOCR."""
+    """RGB-PIL-Bild -> Zeilen (achsparalleles Rechteck um das OCR-Viereck), Reihenfolge wie RapidOCR.
+
+    Wortboxen (``return_word_box``, RapidOCR 3.9.0) werden je Zeile nur uebernommen, wenn die Liste genau so lang ist
+    wie die Zeilenliste und die Zuordnung je Zeile belegt ist (``_woerter``); sonst bleibt ``woerter`` None."""
     import numpy as np
 
     arr = np.asarray(bild)
-    out = _rapidocr()(arr)
+    out = _rapidocr()(arr, return_word_box=True)
     boxes = getattr(out, "boxes", None)
     txts = getattr(out, "txts", None)
     if boxes is None or txts is None:
         return []
+    wortlisten = getattr(out, "word_results", None)
+    if not wortlisten or len(wortlisten) != len(txts):
+        wortlisten = [None] * len(txts)
     zeilen: List[OcrZeile] = []
-    for box, txt in zip(boxes, txts):
+    for box, txt, worte in zip(boxes, txts, wortlisten):
         xs = [float(p[0]) for p in box]
         ys = [float(p[1]) for p in box]
-        zeilen.append(OcrZeile(int(min(xs)), int(min(ys)), int(max(xs) + 0.999), int(max(ys) + 0.999), str(txt)))
+        z = OcrZeile(int(min(xs)), int(min(ys)), int(max(xs) + 0.999), int(max(ys) + 0.999), str(txt))
+        z.woerter = _woerter(z, worte)
+        zeilen.append(z)
     return zeilen
 
 
