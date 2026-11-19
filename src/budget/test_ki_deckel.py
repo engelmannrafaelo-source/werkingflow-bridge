@@ -27,17 +27,21 @@ jede fuer ALLE Wege ihrer Art:
      `job_lauf_pruefen` (Job-Runner, vor JEDEM Executor): dieselbe Regel fuer
      gespeicherte Jobs — auch alte, auch Erkunder (eigener Transport).
   3. `tor` (Chat): Haiku, keine Werkzeuge, Direktweg erzwungen, X-Test-Lauf
-     Pflicht, Reservierung gegen Lauf 0,50 / App-Tag 10,00 / Gesamt-Tag 20,00 EUR,
-     idempotent (test_ki_buchung), Abrechnung nur aus `UsageMessung`.
+     Pflicht, Reservierung (Buchung) idempotent (test_ki_buchung), Abrechnung nur
+     aus `UsageMessung`. Seit 19.11.2026 (Rafael: "kein Limit") KEIN Euro-Halt
+     mehr: Lauf 0,50 / App-Tag 10,00 / Gesamt-Tag 20,00 EUR sind nur noch
+     Meldeschwellen (laute Logzeile), es wird nie wegen Euro abgewiesen und
+     nichts geschlossen. Gebucht wird weiter jeder Aufruf.
 
 Fehlercodes:
   403 KI_IM_TEST_GESPERRT (grund modell_nicht_haiku | werkzeuge | weg | ohne_lauf
       | lauf_ungueltig | app_unbekannt | ohne_nutzer | nutzer_unbekannt)
   403 KI_TEST_NUR_CHAT        (Nicht-Chat-Weg fuer einen Testaufruf)
   403 KI_TEST_DECKEL_INAKTIV  (Testaufruf auf einer Bridge mit Schalter aus)
-  402 KI_TEST_DECKEL_ERREICHT (ebene lauf | tag | gesamt)
   503 KI_TEST_DECKEL_NICHT_LESBAR (platform-api / Job-Store / Prinzipal nicht
-      lesbar; mit X-Bridge-Dependency-Unavailable, ein Job parkt)
+      lesbar, oder die Buchung wurde nicht bestaetigt; mit
+      X-Bridge-Dependency-Unavailable, ein Job parkt)
+  (402 KI_TEST_DECKEL_ERREICHT entfaellt seit 19.11.2026.)
 """
 from __future__ import annotations
 
@@ -60,9 +64,12 @@ SCHALTER = "BRIDGE_TEST_KI_DECKEL"
 TEST_PRINZIPALE = "BRIDGE_TEST_KI_PRINZIPALE"
 MODELL = "claude-haiku-5-5"
 DIREKT_TIER = "claude-direct-notools"
-DECKEL_LAUF_EUR = 0.50
-DECKEL_TAG_EUR = 10.00
-DECKEL_GESAMT_EUR = 20.00
+# Meldeschwellen, KEINE Halte (Rafael 19.11.2026): ueberschreitet eine Summe
+# die Schwelle, gibt es eine laute Logzeile, keine Abweisung.
+MELDUNG_LAUF_EUR = 0.50
+MELDUNG_TAG_EUR = 10.00
+MELDUNG_GESAMT_EUR = 20.00
+MELDESCHWELLEN = (("gesamt", MELDUNG_GESAMT_EUR), ("lauf", MELDUNG_LAUF_EUR), ("tag", MELDUNG_TAG_EUR))
 LAUF_KOPF = "X-Test-Lauf"
 _LAUF_MUSTER = re.compile(r"^[0-9a-f]{64}$")
 
@@ -86,7 +93,6 @@ CACHE_ANLAGE_MULT = 2.0
 CODE_GESPERRT = "KI_IM_TEST_GESPERRT"
 CODE_NUR_CHAT = "KI_TEST_NUR_CHAT"
 CODE_INAKTIV = "KI_TEST_DECKEL_INAKTIV"
-CODE_DECKEL = "KI_TEST_DECKEL_ERREICHT"
 CODE_NICHT_LESBAR = "KI_TEST_DECKEL_NICHT_LESBAR"
 
 # Wert von X-Bridge-Dependency-Unavailable, wenn Job-Store/Prinzipal/platform-api
@@ -523,15 +529,15 @@ async def _summen_sperren(conn, app: str, tag: str, lauf: str) -> Dict[str, Dict
     return summen
 
 
-async def _summen_buchen(conn, app: str, tag: str, lauf: str, delta: float, *, aufruf: int = 0,
-                         schliessen: bool = False) -> None:
+async def _summen_buchen(conn, app: str, tag: str, lauf: str, delta: float, *, aufruf: int = 0) -> None:
+    # Die Spalte `geschlossen` wird seit 19.11.2026 weder gesetzt noch gelesen (kein Euro-Halt).
     await conn.execute(
         "UPDATE test_ki_summe SET summe_eur = GREATEST(summe_eur + $4, 0), aufrufe = aufrufe + $5, "
-        "geschlossen = geschlossen OR ($6 AND ebene IN ('lauf', 'tag')), aktualisiert = now() WHERE "
+        "aktualisiert = now() WHERE "
         "(ebene = 'gesamt' AND app_id = '*' AND schluessel = $2) OR "
         "(ebene = 'lauf' AND app_id = $1 AND schluessel = $3) OR "
         "(ebene = 'tag' AND app_id = $1 AND schluessel = $2)",
-        app, tag, lauf, delta, aufruf, schliessen,
+        app, tag, lauf, delta, aufruf,
     )
 
 
@@ -547,8 +553,12 @@ async def db_reservieren(
 ) -> Dict[str, Any]:
     """Atomar und idempotent: dieselbe reservierung_id bucht hoechstens einmal.
 
-    Antwort {ok: bool, duplikat?: bool, ebene?: 'lauf'|'tag'|'gesamt', grund?,
-    lauf_summe, tag_summe, gesamt_summe}.
+    Kein Euro-Halt (19.11.2026): jede neue ID wird gebucht, auch ueber einer
+    Meldeschwelle und auch auf einer frueher geschlossenen Summenzeile.
+    Antwort {ok: True, duplikat: bool, ueber: [ebene...], erstmals_ueber: [ebene...],
+    lauf_summe, tag_summe, gesamt_summe}; `ueber` = Ebenen, deren Summe nach der
+    Buchung ueber der Meldeschwelle liegt, `erstmals_ueber` = davon die, die mit
+    dieser Buchung die Schwelle ueberschreiten.
     """
     from src.db.client import get_pool
 
@@ -565,11 +575,7 @@ async def db_reservieren(
                 if vorhanden["app_id"] != app or vorhanden["lauf"] != lauf:
                     raise ValueError("reservierung_id gehoert zu einer anderen Buchung")
                 return _antwort(summen, ok=True, duplikat=True)
-            for ebene, deckel in (("gesamt", DECKEL_GESAMT_EUR), ("lauf", DECKEL_LAUF_EUR), ("tag", DECKEL_TAG_EUR)):
-                if summen[ebene]["zu"]:
-                    return _antwort(summen, ok=False, ebene=ebene, grund="geschlossen")
-                if summen[ebene]["summe"] + betrag_eur > deckel:
-                    return _antwort(summen, ok=False, ebene=ebene, grund="ueberschritten")
+            vorher = {e: summen[e]["summe"] for e in summen}
             await conn.execute(
                 "INSERT INTO test_ki_buchung (reservierung_id, app_id, tag, lauf, reserviert_eur) "
                 "VALUES ($1, $2, $3, $4, $5)",
@@ -578,15 +584,18 @@ async def db_reservieren(
             await _summen_buchen(conn, app, tag, lauf, betrag_eur, aufruf=1)
             for e in summen.values():
                 e["summe"] += betrag_eur
-    return _antwort(summen, ok=True, duplikat=False)
+    ueber = [e for e, s in MELDESCHWELLEN if summen[e]["summe"] > s]
+    erstmals = [e for e, s in MELDESCHWELLEN if summen[e]["summe"] > s and vorher[e] <= s]
+    return _antwort(summen, ok=True, duplikat=False, ueber=ueber, erstmals_ueber=erstmals)
 
 
 async def db_abrechnen(*, reservierung_id: uuid.UUID, ist_eur: Optional[float]) -> Dict[str, Any]:
     """Genau einmal je reservierung_id (status offen -> abgerechnet).
 
     ist_eur None = nicht gemessen: die Reservierung bleibt voll stehen. Ist der
-    gemessene Wert ueber der Reservierung, wird er gebucht und Lauf + App-Tag
-    werden geschlossen. Antwort {abgerechnet: bool, delta, geschlossen, Summen?}.
+    gemessene Wert ueber der Reservierung, wird er gebucht; geschlossen wird
+    seit 19.11.2026 nichts mehr (kein Euro-Halt). Antwort {abgerechnet: bool,
+    delta, geschlossen: False, Summen}.
     """
     from src.db.client import get_pool
 
@@ -609,11 +618,10 @@ async def db_abrechnen(*, reservierung_id: uuid.UUID, ist_eur: Optional[float]) 
                 return _antwort(summen, abgerechnet=False, delta=0.0, geschlossen=False)
             reserviert = float(zeile["reserviert_eur"])
             delta = 0.0 if ist_eur is None else round(float(ist_eur) - reserviert, 6)
-            schliessen = ist_eur is not None and float(ist_eur) > reserviert
-            await _summen_buchen(conn, b["app_id"], b["tag"], b["lauf"], delta, schliessen=schliessen)
+            await _summen_buchen(conn, b["app_id"], b["tag"], b["lauf"], delta)
             for e in summen.values():
                 e["summe"] = max(e["summe"] + delta, 0.0)
-    return _antwort(summen, abgerechnet=True, delta=delta, geschlossen=schliessen)
+    return _antwort(summen, abgerechnet=True, delta=delta, geschlossen=False)
 
 
 # ── Worker-Seite: nur platform-api, sonst fail-closed ────────────────────────
@@ -640,7 +648,7 @@ async def tor(
     erzwinge_direktweg,
 ):
     """Rueckgabe None = kein Testaufruf; sonst die erzwungene BackendConfig des
-    Direktwegs. Wirft 403/402/503 (siehe Modulkopf). Ab einem positiven
+    Direktwegs. Wirft 403/503 (siehe Modulkopf), nie wegen Euro. Ab einem positiven
     Testgrund endet jeder Zweig in einer Reservierung oder einer Abweisung —
     nie in None. `erzwinge_direktweg()` liefert die BackendConfig fuer DIREKT_TIER."""
     _aktuell.set(None)
@@ -707,26 +715,28 @@ async def tor(
         logger.error("test-ki-deckel: Reservierung ohne klares Ergebnis (%s) — gesperrt", e)
         raise _nicht_lesbar("Test-KI-Deckel nicht lesbar/schreibbar (fail-closed).")
 
-    if not erg.get("ok"):
-        ebene = erg.get("ebene")
-        deckel = {"lauf": DECKEL_LAUF_EUR, "tag": DECKEL_TAG_EUR, "gesamt": DECKEL_GESAMT_EUR}.get(ebene)
-        summe = erg.get(f"{ebene}_summe")
-        logger.warning(
-            "test-ki deckel erreicht testgrund=%s prinzipal=%s app=%s ebene=%s grund=%s summe=%s deckel=%s betrag=%.6f lauf=%s",
-            grund, p_name, app, ebene, erg.get("grund"), summe, deckel, betrag, lauf,
+    if erg.get("ok") is not True:
+        # Kein Euro-Halt mehr: ok ist immer True. Alles andere heisst "nicht gebucht"
+        # (z. B. platform-api noch auf altem Code) -> ohne Buchung kein Aufruf.
+        logger.error(
+            "test-ki-deckel: Reservierung nicht gebucht (ok=%r ebene=%s grund=%s) app=%s lauf=%s — gesperrt",
+            erg.get("ok"), erg.get("ebene"), erg.get("grund"), app, lauf,
         )
-        raise _fehler(
-            402, CODE_DECKEL,
-            f"Test-KI-Deckel je {ebene} erreicht ({erg.get('grund')}; {summe} von {deckel} EUR, Aufruf braeuchte bis {betrag:.4f}).",
-            ebene=ebene, grund=erg.get("grund"), summe_eur=summe, deckel_eur=deckel, reservierung_eur=betrag,
+        raise _nicht_lesbar("Test-KI-Buchung nicht bestaetigt (fail-closed, kein Euro-Halt).")
+    for ebene in erg.get("erstmals_ueber") or ():
+        logger.warning(
+            "test-ki: Euro-Schwelle ueberschritten (nur Meldung, kein Halt) ebene=%s summe=%s schwelle=%s "
+            "testgrund=%s prinzipal=%s app=%s lauf=%s",
+            ebene, erg.get(f"{ebene}_summe"), dict(MELDESCHWELLEN).get(ebene), grund, p_name, app, lauf,
         )
 
     _aktuell.set(Reservierung(reservierung_id=rid, app=app, lauf=lauf, tag=tag, betrag_eur=betrag))
     logger.info(
-        "test-ki echt, gedeckelt testgrund=%s prinzipal=%s app=%s lauf=%s reserviert=%.6f (ein<=%d aus<=%d) "
-        "lauf_summe=%.4f/%.2f tag_summe=%.4f/%.2f gesamt=%.4f/%.2f EUR",
-        grund, p_name, app, lauf, betrag, eingabe, ausgabe, float(erg.get("lauf_summe") or 0), DECKEL_LAUF_EUR,
-        float(erg.get("tag_summe") or 0), DECKEL_TAG_EUR, float(erg.get("gesamt_summe") or 0), DECKEL_GESAMT_EUR,
+        "test-ki echt, gebucht testgrund=%s prinzipal=%s app=%s lauf=%s reserviert=%.6f (ein<=%d aus<=%d) "
+        "lauf_summe=%.4f/%.2f tag_summe=%.4f/%.2f gesamt=%.4f/%.2f EUR (Meldeschwellen) ueber=%s",
+        grund, p_name, app, lauf, betrag, eingabe, ausgabe, float(erg.get("lauf_summe") or 0), MELDUNG_LAUF_EUR,
+        float(erg.get("tag_summe") or 0), MELDUNG_TAG_EUR, float(erg.get("gesamt_summe") or 0), MELDUNG_GESAMT_EUR,
+        ",".join(erg.get("ueber") or ()) or "-",
     )
     return cfg
 
@@ -761,12 +771,12 @@ async def abrechnen(messung: Any) -> None:
             "reservierung_id": r.reservierung_id, "ist_eur": ist,
         })
         logger.info(
-            "test-ki echt, gedeckelt app=%s lauf=%s ist=%s reserviert=%.6f geschlossen=%s "
-            "lauf_summe=%.4f/%.2f tag_summe=%.4f/%.2f gesamt=%.4f/%.2f EUR",
+            "test-ki echt, abgerechnet app=%s lauf=%s ist=%s reserviert=%.6f "
+            "lauf_summe=%.4f/%.2f tag_summe=%.4f/%.2f gesamt=%.4f/%.2f EUR (Meldeschwellen)",
             r.app, r.lauf, "nicht gemessen" if ist is None else f"{ist:.6f}", r.betrag_eur,
-            erg.get("geschlossen"), float(erg.get("lauf_summe") or 0), DECKEL_LAUF_EUR,
-            float(erg.get("tag_summe") or 0), DECKEL_TAG_EUR,
-            float(erg.get("gesamt_summe") or 0), DECKEL_GESAMT_EUR,
+            float(erg.get("lauf_summe") or 0), MELDUNG_LAUF_EUR,
+            float(erg.get("tag_summe") or 0), MELDUNG_TAG_EUR,
+            float(erg.get("gesamt_summe") or 0), MELDUNG_GESAMT_EUR,
         )
     except Exception as e:
         logger.error(

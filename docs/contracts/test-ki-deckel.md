@@ -1,12 +1,14 @@
-# Vertrag: Test-KI-Deckel (gedeckelte echte KI für Testaufrufe, nur Haiku-Chat)
+# Vertrag: Test-KI-Deckel (echte KI für Testaufrufe, nur Haiku-Chat, gebucht ohne Euro-Halt)
 
-Stand: 27.10.2026, R4 nach Codex (`PRUEFUNG-ENTWURF-R4.md`) mit Umfangsentscheidung (a) des Vize: Test-KI heißt **nur Haiku-Chat**. Auftrag: KD 91624155, Grundlage Rafael 27.10. 16:36Z. Code: `src/budget/test_ki_deckel.py`, Migration `072_test_ki_deckel.sql`.
+**Änderung 19.11.2026 (Rafael: „schalte den Kostendeckel aus – den braucht niemand“, „kein Limit“):** Der Euro-Halt entfällt. 0,50 € je Lauf, 10 € je App und Tag und 20 € gesamt je Tag sind nur noch **Meldeschwellen**. Beim ersten Überschreiten je Ebene erscheint die Logzeile `test-ki: Euro-Schwelle ueberschritten (nur Meldung, kein Halt)`. Es gibt kein 402 `KI_TEST_DECKEL_ERREICHT` mehr, und Lauf/App-Tag werden nicht mehr geschlossen. Unverändert bleiben: Buchung jedes Aufrufs (Reservierung und Abrechnung über platform-api), Testgrund-, Prinzipal- und Rechteprüfung, Testisolierung (nur Haiku-Chat, keine Werkzeuge, Direktweg, `X-Test-Lauf` Pflicht), der Schalter `BRIDGE_TEST_KI_DECKEL` (bleibt `1`) und das fail-closed-503, wenn die Buchung nicht schreibbar ist.
+
+Ursprünglicher Stand: 27.10.2026, R4 nach Codex (`PRUEFUNG-ENTWURF-R4.md`) mit Umfangsentscheidung (a) des Vize: Test-KI heißt **nur Haiku-Chat**. Auftrag: KD 91624155, Grundlage Rafael 27.10. 16:36Z. Code: `src/budget/test_ki_deckel.py`, Migration `072_test_ki_deckel.sql`.
 
 ## Zweck
 
-Tester von werking-works und werking-report prüfen mit echter KI, aber nur mit Haiku und nur gedeckelt.
+Tester von werking-works und werking-report prüfen mit echter KI, aber nur mit Haiku und nur gebucht (seit 19.11.2026 ohne Euro-Halt).
 
-Die Apps sperren Testaufrufe selbst (`KI_IM_TEST_GESPERRT`). Nur in der **Preview** und nur mit ihrem Schalter `KI_TEST_ECHT_GEDECKELT=1` lassen sie Haiku-Chat durch. Dabei setzen sie `X-Test-Lauf`, den sha256 einer geprüften Sitzungskennung. Diese Bridge-Seite ist der Deckel dahinter. Zugleich ist sie die Rückversicherung, falls ein Aufruf die App-Sperre umgeht.
+Die Apps sperren Testaufrufe selbst (`KI_IM_TEST_GESPERRT`). Nur in der **Preview** und nur mit ihrem Schalter `KI_TEST_ECHT_GEDECKELT=1` lassen sie Haiku-Chat durch. Dabei setzen sie `X-Test-Lauf`, den sha256 einer geprüften Sitzungskennung. Diese Bridge-Seite ist die Prüf- und Buchungsstelle dahinter. Zugleich ist sie die Rückversicherung, falls ein Aufruf die App-Sperre umgeht.
 
 ## Vertrauensrichtung: Angaben können nur einschränken
 
@@ -19,7 +21,7 @@ Ein Aufruf ist ein **Testaufruf**, wenn mindestens eine der folgenden Bedingunge
 Alle anderen Aufrufe bleiben unberührt: Legacy, Works-Prod (`engelmann-vercel-dev`), Workflow-Engine und Prod. Weder Kopf noch Mandant noch `account_type` befreien von etwas. `account_type` wird nicht gelesen.
 
 **Der Umfang ist bewusst eng gefasst:**
-- Report-Testläufe sind nur gedeckelt, wenn die Report-Sperre den Marker setzt. `report-vercel-dev` steht nicht in der Liste, weil über ihn auch Nicht-Testkonten der Preview mit Sonnet laufen.
+- Report-Testläufe werden nur dann als Testaufruf behandelt, wenn die Report-Sperre den Marker setzt. `report-vercel-dev` steht nicht in der Liste, weil über ihn auch Nicht-Testkonten der Preview mit Sonnet laufen.
 - Der Marker wirkt **nur auf einer Bridge mit diesem Code** (R4). Ein älterer Dienst ignoriert ihn, ebenso ein fremder OpenAI-kompatibler Dienst (Local-Fallback, `baseUrl`-Override).
 - Eine `fetch`-Referenz, die vor der App-Sperre gespeichert wurde und zugleich den alten geteilten Schlüssel nutzt, ist eine bestehende Grenze der Apps. R4 schließt sie nicht.
 
@@ -30,7 +32,7 @@ Alle anderen Aufrufe bleiben unberührt: Legacy, Works-Prod (`engelmann-vercel-d
 | `BRIDGE_TEST_KI_DECKEL` | `1` = Test-KI aktiv. Jeder andere Wert bedeutet: **jeder Testaufruf 403 `KI_TEST_DECKEL_INAKTIV`**. Ein Kopf allein öffnet also keinen ungedeckelten Weg. Prod setzt ihn nie. |
 | `BRIDGE_TEST_KI_PRINZIPALE` | Kommagetrennte `service_principals.name`, deren Aufrufe alle Testaufrufe sind. Dev: **leer** (K67, 27.10.2026: Works und Report nur über (c); ein Eintrag sperrte jeden Nicht-Chat-Weg aller Nutzer dieses Prinzipals). Leer bedeutet: nur (c). |
 
-Kein Secret. Die Deckel (0,50 € je Lauf, 10 € je App und Tag, 20 € gesamt je Tag) sind Konstanten im Code. Für (a) und (b) muss `BRIDGE_PRINCIPALS_ENABLED=true` gesetzt sein.
+Kein Secret. Die Meldeschwellen (0,50 € je Lauf, 10 € je App und Tag, 20 € gesamt je Tag, `MELDUNG_*_EUR`) sind Konstanten im Code; sie halten nichts an. Für (a) und (b) muss `BRIDGE_PRINCIPALS_ENABLED=true` gesetzt sein.
 
 ## Drei Prüfstellen, jede für alle Wege ihrer Art
 
@@ -56,16 +58,16 @@ Kein Secret. Die Deckel (0,50 € je Lauf, 10 € je App und Tag, 20 € gesamt 
 | `X-Test-Lauf` leer, ungültig oder mehrfach | 403 | `KI_IM_TEST_GESPERRT` | `grund: lauf_ungueltig` |
 | App ohne Test-Deckel | 403 | `KI_IM_TEST_GESPERRT` | `grund: app_unbekannt` |
 | ohne `X-User-ID` bzw. Nutzer unbekannt | 403 | `KI_IM_TEST_GESPERRT` | `grund: ohne_nutzer` bzw. `nutzer_unbekannt` |
-| Deckel überschritten oder Lauf/Tag geschlossen | 402 | `KI_TEST_DECKEL_ERREICHT` | `ebene`, `grund`, `summe_eur`, `deckel_eur`, `reservierung_eur` |
-| platform-api, Job-Store oder Prinzipal nicht lesbar | 503 | `KI_TEST_DECKEL_NICHT_LESBAR` | `X-Bridge-Dependency-Unavailable: test-ki-deckel` (ein Job parkt) |
+| Summe über einer Meldeschwelle | — | — | **kein Fehler**: Aufruf läuft, Buchung erfolgt, Logzeile beim ersten Überschreiten je Ebene (seit 19.11.2026; vorher 402 `KI_TEST_DECKEL_ERREICHT`) |
+| platform-api, Job-Store oder Prinzipal nicht lesbar, oder Reservierung nicht als gebucht bestätigt (`ok` ≠ true) | 503 | `KI_TEST_DECKEL_NICHT_LESBAR` | `X-Bridge-Dependency-Unavailable: test-ki-deckel` (ein Job parkt) |
 | Nicht-Chat-Weg | 403 | `KI_TEST_NUR_CHAT` | `testgrund`, `weg` |
 | Schalter aus | 403 | `KI_TEST_DECKEL_INAKTIV` | `testgrund` |
 
 Ab einem positiven Testgrund endet jeder Zweig mit einer Reservierung oder einer Abweisung, nie mit „kein Test“.
 
 **Weg.**
-- Jeder gedeckelte Aufruf läuft über `claude-direct-notools` mit `claude-haiku-5-5`: ein Messages-API-Aufruf ohne Werkzeuge, `max_tokens` wirksam, Streaming als Minimal-SSE.
-- Das kostet echtes Geld auf dem Prepaid-Schlüssel (KD D-1). Deshalb greift zusätzlich die bestehende 90-€-Rolling-Grenze.
+- Jeder Testaufruf läuft über `claude-direct-notools` mit `claude-haiku-5-5`: ein Messages-API-Aufruf ohne Werkzeuge, `max_tokens` wirksam, Streaming als Minimal-SSE.
+- Die Prepaid-Rolling-Grenze der Bridge ist seit 19.11.2026 auf Dev ebenfalls aus (`PREPAID_VISION_DAILY_CAP_ENABLED=false`); die Ledger-Buchung (`usage_events`) bleibt.
 - Fallback-Ketten sind gesperrt.
 
 **Reservierung (Obergrenze).**
@@ -78,20 +80,23 @@ Ab einem positiven Testgrund endet jeder Zweig mit einer Reservierung oder einer
 - „Vollständig“ heißt: `usage` ist ein dict, und alle vier Felder (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`) sind `type(x) is int` und ≥ 0.
 - Nur der Torzweig übergibt `call_anthropic_direct` ein **frisches**, nur diesem Aufruf gehörendes `MessungZiel`. Die Messung erscheint deshalb nie in JSON, SSE, Job-Ergebnis oder Fallback-Antworten.
 - Erstattet wird nur bei `quelle=anthropic_messages_api` und `vollstaendig`. In jedem anderen Fall, auch bei Fehler oder Abbruch, bleibt die volle Reservierung stehen.
-- Liegt der Ist-Wert über der Reservierung, wird er gebucht, und **Lauf und App-Tag werden geschlossen**.
+- Liegt der Ist-Wert über der Reservierung, wird er gebucht. Geschlossen wird nichts (seit 19.11.2026); die Spalte `test_ki_summe.geschlossen` wird weder gesetzt noch gelesen.
 - Die Ledger-`usage` des Direktwegs bleibt wie bisher ohne Cache-Kategorien. Repariert wird die Deckelabrechnung, nicht das Ledger.
 
 **Lauf.** Der Schlüssel besteht aus UTC-Tag, Bridge-Nutzer-UUID und `X-Test-Lauf`. `X-Workflow-ID` bleibt unberührt.
 
 **Idempotenz.**
 - `reservierung_id` (uuid4 je Aufruf) ist Primärschlüssel in `test_ki_buchung`.
-- Wiederholtes Reservieren gibt das gespeicherte Urteil zurück und bucht nichts.
+- Wiederholtes Reservieren gibt `ok: true, duplikat: true` zurück und bucht nichts.
+- Eine neue Reservierung wird immer gebucht: `ok: true`, dazu `ueber` (Ebenen über der Meldeschwelle) und `erstmals_ueber` (mit dieser Buchung überschritten).
 - Abrechnen geht genau einmal (`offen` → `abgerechnet`).
 - **Einziger Schreibweg ist platform-api.**
 
 **Protokoll.**
-- `test-ki echt, gedeckelt testgrund=… prinzipal=<Name> app=… lauf=… reserviert|ist=… lauf_summe=x/0.50 tag_summe=y/10.00 gesamt=z/20.00 EUR`
-- `test-ki deckel erreicht …`, `test-ki gesperrt …`, `test-ki nur chat …`, `test-ki inaktiv …`
+- `test-ki echt, gebucht testgrund=… prinzipal=<Name> app=… lauf=… reserviert=… lauf_summe=x/0.50 tag_summe=y/10.00 gesamt=z/20.00 EUR (Meldeschwellen) ueber=…`
+- `test-ki echt, abgerechnet app=… lauf=… ist=… …`
+- `test-ki: Euro-Schwelle ueberschritten (nur Meldung, kein Halt) ebene=… summe=… schwelle=…`
+- `test-ki gesperrt …`, `test-ki nur chat …`, `test-ki inaktiv …`, `Reservierung nicht gebucht …`
 - Bei verlorener Antwort: `Abrechnung Ausgang unklar …`
 
 ## Innen-API (platform-api, Service-Token)
@@ -99,6 +104,8 @@ Ab einem positiven Testgrund endet jeder Zweig mit einer Reservierung oder einer
 `POST /v1/internal/test-ki-deckel/reservieren` und `…/abrechnen`. Die Testkonto-Abfrage aus R2 ist entfallen.
 
 ## Rückweg
+
+**Auslieferungsreihenfolge (19.11.2026):** platform-api vor den Workern. Ein neuer Worker an einer alten platform-api bekäme bei überschrittener Schwelle `ok: false` (nicht gebucht) und antwortet dann 503 statt 402. Ein alter Worker an einer neuen platform-api wirft nie mehr 402, weil sie immer bucht.
 
 - Zuerst den **App-Schalter** löschen, danach den Bridge-Schalter.
 - Wird nur der Bridge-Schalter gelöscht, sperrt die Bridge jeden Testaufruf selbst mit 403 `KI_TEST_DECKEL_INAKTIV`.

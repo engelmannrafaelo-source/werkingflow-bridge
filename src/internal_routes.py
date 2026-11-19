@@ -634,8 +634,9 @@ async def post_test_ki_reservieren(
     body: KiDeckelReservierenRequest,
     _claims: AuthClaims = Depends(require_service_token),
 ) -> Dict[str, Any]:
-    """Mirrors src.budget.test_ki_deckel.db_reservieren. Deckel stehen im Code
-    (nicht im Rumpf); eine ID, die zu einer anderen Buchung gehoert, ist 409."""
+    """Mirrors src.budget.test_ki_deckel.db_reservieren. Bucht immer (kein Euro-Halt
+    seit 19.11.2026, Meldeschwellen im Code); eine ID, die zu einer anderen Buchung
+    gehoert, ist 409."""
     from src.budget.test_ki_deckel import db_reservieren
 
     try:

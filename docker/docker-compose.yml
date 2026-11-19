@@ -131,7 +131,7 @@ services:
       # Prepaid Anthropic vision-key daily spend cap (fail-open, read per-call).
       # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
-      - PREPAID_VISION_DAILY_CAP_ENABLED=true
+      - PREPAID_VISION_DAILY_CAP_ENABLED=false
       - PREPAID_VISION_DAILY_CAP_EUR=400
       # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
       # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
@@ -350,7 +350,7 @@ services:
       # Prepaid Anthropic vision-key daily spend cap (fail-open, read per-call).
       # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
-      - PREPAID_VISION_DAILY_CAP_ENABLED=true
+      - PREPAID_VISION_DAILY_CAP_ENABLED=false
       - PREPAID_VISION_DAILY_CAP_EUR=400
       # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
       # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
@@ -569,7 +569,7 @@ services:
       # Prepaid Anthropic vision-key daily spend cap (fail-open, read per-call).
       # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
-      - PREPAID_VISION_DAILY_CAP_ENABLED=true
+      - PREPAID_VISION_DAILY_CAP_ENABLED=false
       - PREPAID_VISION_DAILY_CAP_EUR=400
       # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
       # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
@@ -788,7 +788,7 @@ services:
       # Prepaid Anthropic vision-key daily spend cap (fail-open, read per-call).
       # Guards the vision_prepaid lane — real prepaid money the ledger books as 0€.
       # Kill switch: set ENABLED=false + recreate. See src/routing/prepaid_cap.py.
-      - PREPAID_VISION_DAILY_CAP_ENABLED=true
+      - PREPAID_VISION_DAILY_CAP_ENABLED=false
       - PREPAID_VISION_DAILY_CAP_EUR=400
       # Test-KI-Deckel (nur Dev, nie Prod): Testaufrufe (Prinzipal aus
       # TEST_KI_PRINZIPALE, Job eines solchen Prinzipals, oder X-Test-Lauf) duerfen
