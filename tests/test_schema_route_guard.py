@@ -238,8 +238,37 @@ def _run_analyze(monkeypatch, *, key, pool_url, prod_key_only):
         calls["key"] = (headers or {}).get("x-api-key")
         return _Resp()
 
+    class _StreamResp:
+        # G-7b (19.11.2026): der Schema-Direktweg streamt (client.stream); Attrappe liefert dieselbe Antwort als SSE.
+        status_code = 200
+        headers = {}
+
+        def __init__(self, headers):
+            calls["direct"] += 1
+            calls["key"] = (headers or {}).get("x-api-key")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aiter_lines(self):
+            import json as _j
+            d = _Resp().json()
+            for e in ({"type": "message_start", "message": {"model": d["model"], "content": [], "usage": d["usage"]}},
+                      {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                      {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ok"}},
+                      {"type": "message_delta", "delta": {"stop_reason": d["stop_reason"]}, "usage": {}},
+                      {"type": "message_stop"}):
+                yield "data: " + _j.dumps(e)
+
+    def _stream(self, method, url, headers=None, json=None, **kw):
+        return _StreamResp(headers)
+
     monkeypatch.setattr(credit_pool, "post_messages", _pool)
     monkeypatch.setattr(vp.httpx.AsyncClient, "post", _post)
+    monkeypatch.setattr(vp.httpx.AsyncClient, "stream", _stream)
     tok = credit_pool.PROD_KEY_ONLY.set(prod_key_only)
     try:
         asyncio.run(prov.analyze(messages=[{"role": "user", "content": "synthetisch"}], model=EXPECTED_MODEL, max_tokens=1))
