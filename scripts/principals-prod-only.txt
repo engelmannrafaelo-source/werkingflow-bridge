@@ -14,3 +14,9 @@
 # (T-SCHEMA-PROD-BRIDGE, Rafael 16.11.2026): Prod-Budget, Bedrock-EU-Pin, Weg-B-Route.
 # Auf Dev gueltig hiesse: Prod-Identitaet ueber die Dev-Bridge ohne EU-Guard.
 homepage-mini-schema-prod
+
+# Prod-Testprincipal des Schema-Generators (T-SCHEMA-PROD-BRIDGE, P2 19.11.2026, Kanzler-Wort 19.11.):
+# wsg_-Schluessel fuer Rafaels Prod-Test mit anthropic_direct-Pin + NONEU-Testliste.
+# Auf Dev gueltig hiesse: Prod-Testidentitaet ueber die Dev-Bridge ohne den Prod-Guard.
+# Am 19.11. 10:48:52Z per Phase 3.6 nach Dev kopiert (v8g-Lauf); dortige Zeile wird einmalig deaktiviert.
+werking-schema-rafael-prod-test
