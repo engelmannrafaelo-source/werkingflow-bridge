@@ -162,6 +162,23 @@ async def _open_sum(conn, user_id: uuid.UUID, plan_id: str, periodenbeginn: date
     return float(v or 0)
 
 
+#: Ausdrueckliche Abschaltung der Euro-Abbruchbedingung (Rafael 19.11.2026 "Kostendeckel aus", Kanzler-Wort): steht in
+#: plans.metadata des AKTIVEN Plans genau {"budget_enforcement": "off"}, fuehrt "Rest ueberschritten" NICHT zum Abbruch.
+#: Reservierung, Abbuchung, Ledger, Periodenwechsel und alle anderen Ablehnungen (kein Topf, 400/409/503 im Tor) bleiben.
+#: Jeder andere Wert, fehlendes Feld, inaktiver/unbekannter Plan oder Lesefehler -> Pruefung AN (fail-safe).
+EURO_PRUEFUNG_SCHLUESSEL = "budget_enforcement"
+EURO_PRUEFUNG_AUS = "off"
+
+
+async def _euro_pruefung_aus(conn, plan_id: str) -> bool:
+    """True NUR bei plans.metadata->>'budget_enforcement' == 'off' (exakt) fuer genau diesen aktiven Plan."""
+    wert = await conn.fetchval(
+        "SELECT metadata->>'budget_enforcement' FROM plans WHERE id = $1 AND is_active",
+        plan_id,
+    )
+    return wert == EURO_PRUEFUNG_AUS
+
+
 async def db_reserve(*, reservation_id: uuid.UUID, user_id: uuid.UUID, plan_id: str,
                      amount_eur: float) -> Dict[str, Any]:
     """Atomar und idempotent. Antwort {ok, duplicate, reason?, limitEur, usedEur, reservedEur, remainingEur}."""
@@ -190,16 +207,28 @@ async def db_reserve(*, reservation_id: uuid.UUID, user_id: uuid.UUID, plan_id: 
             limit, used, periodenbeginn = topf
             offen = await _open_sum(conn, user_id, plan_id, periodenbeginn)
             rest = round(limit - used - offen, 6)
+            euro_aus = await _euro_pruefung_aus(conn, plan_id)
             if amount_eur > rest:
-                return {"ok": False, "duplicate": False, "reason": "strict_monthly_exhausted",
-                        "limitEur": limit, "usedEur": used, "reservedEur": offen, "remainingEur": max(rest, 0.0)}
+                if not euro_aus:
+                    return {"ok": False, "duplicate": False, "reason": "strict_monthly_exhausted",
+                            "limitEur": limit, "usedEur": used, "reservedEur": offen, "remainingEur": max(rest, 0.0)}
+                logger.warning(
+                    "[StrictReserve] EURO-PRUEFUNG AUS (plans.metadata.%s=%s, plan=%s): Reservierung %s ueber %.6f EUR "
+                    "bei Rest %.6f EUR DURCHGELASSEN (limit=%.6f used=%.6f offen=%.6f)",
+                    EURO_PRUEFUNG_SCHLUESSEL, EURO_PRUEFUNG_AUS, plan_id, reservation_id, amount_eur, rest,
+                    limit, used, offen)
             await conn.execute(
                 "INSERT INTO budget_reservations (reservation_id, user_id, plan_id, amount_eur) "
                 "VALUES ($1, $2, $3, $4)",
                 reservation_id, user_id, plan_id, amount_eur,
             )
-    return {"ok": True, "duplicate": False, "limitEur": limit, "usedEur": used,
-            "reservedEur": round(offen + amount_eur, 6), "remainingEur": round(rest - amount_eur, 6)}
+    antwort = {"ok": True, "duplicate": False, "limitEur": limit, "usedEur": used,
+               "reservedEur": round(offen + amount_eur, 6), "remainingEur": round(rest - amount_eur, 6)}
+    if euro_aus:
+        antwort["enforcement"] = EURO_PRUEFUNG_AUS
+        logger.info("[StrictReserve] Reservierung %s plan=%s mit Euro-Pruefung AUS (Rest danach %.6f EUR)",
+                    reservation_id, plan_id, antwort["remainingEur"])
+    return antwort
 
 
 async def settle_in_tx(conn, *, reservation_id: uuid.UUID, user_id: uuid.UUID, plan_id: str,
