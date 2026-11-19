@@ -463,6 +463,12 @@ async def create_job_endpoint(
             _derived = _attribution_extractor(request) if _attribution_extractor is not None else {}
             if _derived.get("app_id") is None:
                 _derived = {**_derived, "app_id": _schema_auth_app}
+            # Tenant aus demselben Kopf wie die Bildrouten (privacy_image/bridge.py _zaun: X-Tenant-ID), nie aus
+            # dem Rumpf: extract_attribution_context kennt keinen tenant_id, ohne diese Zeile blieb die Bildbindung
+            # (unten, Store, Selbstaufruf bridge.py:265) leer -> 403 image_receipt_principal_mismatch (Prod 19.11.).
+            _tenant_kopf = (request.headers.get("x-tenant-id") or "").strip()
+            if _tenant_kopf:
+                _derived = {**_derived, "tenant_id": _tenant_kopf}
             attribution = bind_schema_job_attribution(attribution, _derived)
     except _SchemaJobError as e:
         raise HTTPException(
