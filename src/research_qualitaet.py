@@ -146,8 +146,9 @@ _SUFFIX_ZWEISTUFIG = frozenset({
     "co.za", "org.za", "gov.za", "co.in", "org.in", "gov.in", "ac.in",
     "com.tr", "gov.tr", "com.mx", "gob.mx", "com.ar", "com.sg", "gov.sg", "com.hk",
     "co.kr", "or.kr", "go.kr", "com.tw", "gov.tw", "co.il", "gov.il", "ac.il",
-    "eu.int", "europa.eu",
 })
+# europa.eu / eu.int are NOT public suffixes: ec.europa.eu and eur-lex.europa.eu count as ONE
+# domain (one institution), like any other site (Nachblick e8511fe6 zu DQ-R2).
 
 
 def _host(url: Any) -> Optional[str]:
