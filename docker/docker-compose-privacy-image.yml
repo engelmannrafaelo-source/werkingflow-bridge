@@ -29,6 +29,9 @@ services:
       PRIVACY_SERVICE_TOKEN: ${PRIVACY_IMAGE_SERVICE_TOKEN:?PRIVACY_IMAGE_SERVICE_TOKEN fehlt}
       PRIVACY_TOKEN_PFLICHT: alle
       UVICORN_WORKERS: "1"
+      # Regel R3 wie im Textweg (Prod/Dev live an): technische Anlagenkennungen im Bild frei
+      # (src/privacy_image/verarbeitung._anlagenkennungen_frei). Kanzler-Entscheid 19.11.2026.
+      BRIDGE_PRIVACY_ANLAGENKENNUNG: "true"
       # Kein ANTHROPIC_*-Schluessel: der Bild-Dienst ruft kein Modell (nur OCR + Presidio lokal). Modell-Caches wie
       # beim Text-Dienst aus dem Image (Flair/spaCy/Docling/RapidOCR vorab geladen); keine abweichenden Offline-Schalter.
     mem_limit: 8g
