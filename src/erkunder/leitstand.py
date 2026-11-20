@@ -23,7 +23,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .dateien import read_bytes, read_text
 from .diagnostik import details, safe_reason, step_record
@@ -65,6 +65,10 @@ class Start(BaseModel):
     worker: str
     claude_token: str
     auftrag: Auftrag
+    # Opaker Eigentuemer-Digest des Jobs (Principal + App + Nutzer), vom Worker aus der SERVER-
+    # SEITIG gestempelten Job-Attribution gebildet, nie aus dem Auftragskoerper. Ohne ihn laeuft
+    # ein Bericht nie neben einem anderen (Kundentrennung, siehe start()).
+    eigentuemer: str | None = Field(default=None, pattern=r"^v1:[0-9a-f]{64}$")
 
 
 class StepFailed(Exception):
@@ -433,6 +437,10 @@ class Coordinator:
                     raise LeitstandHTTPError(410, "bericht_aufgeraeumt")
                 self.aufgeraeumt.pop(ident, None)
             if ident in self.states:
+                bekannter_eigner = self.states[ident].get("eigentuemer")
+                if bekannter_eigner is not None and bekannter_eigner != body.eigentuemer:
+                    # Fremder Aufrufer nennt eine bekannte bericht_id: nichts anhaengen.
+                    raise LeitstandHTTPError(403, "bericht_id_fremder_eigentuemer")
                 fingerabdruck = auftrag_fingerabdruck(body.auftrag)
                 bekannt = self.states[ident].get("fingerabdruck")
                 if bekannt is None:
@@ -453,10 +461,15 @@ class Coordinator:
             if laufende:
                 # Gleichzeitig nur Teile EINER Eltern-Kennung (gleicher Kunde/Lauf): die Plaetze
                 # und Berichtsordner sind fuer sie lesbar, fremde Berichte bleiben getrennt.
+                # Zusaetzlich muss der Eigentuemer (Principal/App/Nutzer des Jobs) gleich sein: die
+                # Eltern-Kennung setzt der Aufrufer selbst, der Eigentuemer nicht.
                 eltern = body.auftrag.eltern_bericht_id
                 fremd = [
                     o for o in laufende
-                    if eltern is None or self.states[o]["auftrag"].get("eltern_bericht_id") != eltern
+                    if eltern is None
+                    or body.eigentuemer is None
+                    or self.states[o]["auftrag"].get("eltern_bericht_id") != eltern
+                    or self.states[o].get("eigentuemer") != body.eigentuemer
                 ]
                 if fremd:
                     raise HTTPException(409, {"belegt": fremd[0]})
@@ -491,6 +504,7 @@ class Coordinator:
                 "erkunder_ausgefallen": [],
                 "korrekturkreis_gelaufen": False,
                 "fingerabdruck": auftrag_fingerabdruck(body.auftrag),
+                "eigentuemer": body.eigentuemer,
             }
             self.tokens[ident] = body.claude_token
             self.token_ready[ident] = asyncio.Event()

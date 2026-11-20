@@ -735,6 +735,18 @@ async def proxy_executor(
     return await _self_post_json(path, body, attribution, timeout_s)
 
 
+def _erkunder_eigentuemer(auftrag: Any, attribution: Optional[dict]) -> dict:
+    """Eigentuemer-Digest nur zusammen mit einer Eltern-Kennung senden (aeltere Leitstaende
+    kennen das Feld nicht). Er stammt aus der serverseitig gestempelten Attribution, nie aus dem
+    Auftrag. Fehlt er bei gesetzter Eltern-Kennung, laeuft der Bericht allein (kein Parallelbetrieb)."""
+    if not getattr(auftrag, "eltern_bericht_id", None):
+        return {}
+    from src.jobs.registry import EIGENTUEMER_KEY
+
+    digest = (attribution or {}).get(EIGENTUEMER_KEY)
+    return {"eigentuemer": digest} if isinstance(digest, str) and digest else {}
+
+
 async def _erkunder_abbruch_gewuenscht(job_id: Optional[str]) -> bool:
     """True, wenn fuer diesen Job ein Abbruchwunsch gespeichert ist. Ein Lesefehler stoppt den
     Lauf nicht (laut geloggt); ohne Job-ID gibt es keinen Wunsch."""
@@ -792,6 +804,7 @@ async def erkunder_executor(
                     f"{url}/start",
                     headers=headers,
                     json={
+                        **_erkunder_eigentuemer(auftrag, attribution),
                         "worker": os.environ.get("INSTANCE_NAME", "unknown"),
                         "claude_token": token,
                         # Ohne Eltern-Kennung das Feld weglassen: ein aelterer Leitstand
