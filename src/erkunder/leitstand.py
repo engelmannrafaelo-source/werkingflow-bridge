@@ -386,10 +386,16 @@ class Coordinator:
             self.deploy_pending = False
             return {"freigegeben": True}
 
-    async def acquire_slot(self, ident: str, name: str) -> int:
+    async def acquire_slot(self, ident: str, name: str, verboten: frozenset[int] = frozenset()) -> int:
+        """Freien Platz belegen. `verboten`: Plaetze, die dieser Schritt nicht nehmen darf
+        (die drei Erkunder eines Berichts muessen auf verschiedenen Plaetzen/UIDs laufen,
+        sonst koennte einer die Ergebnisse der anderen lesen und waere nicht unabhaengig)."""
         async with self.slot_cond:
             while True:
-                free = [i for i in range(len(self.places)) if i not in self.slot_busy]
+                free = [
+                    i for i in range(len(self.places))
+                    if i not in self.slot_busy and i not in verboten
+                ]
                 if free:
                     self.slot_busy[free[0]] = (ident, name)
                     return free[0]
@@ -581,7 +587,13 @@ class Coordinator:
                 else:
                     await self.token_ready[ident].wait()
                     # Platz je Schritt statt fester Zuordnung: wartet, bis einer frei ist.
-                    slot = await self.acquire_slot(ident, name)
+                    verboten = frozenset(
+                        belegt for andere, belegt in state.get("erkunder_plaetze", {}).items()
+                        if name.startswith("erkunder-") and andere != name
+                    )
+                    slot = await self.acquire_slot(ident, name, verboten)
+                    if name.startswith("erkunder-"):
+                        state.setdefault("erkunder_plaetze", {})[name] = slot
                     # Jeder Platz wird vor einem neuen Schritt bereinigt und quittiert
                     # (er kann zuvor einem anderen Bericht/Schritt gedient haben).
                     response = await self.client.post(
