@@ -735,6 +735,21 @@ async def proxy_executor(
     return await _self_post_json(path, body, attribution, timeout_s)
 
 
+async def _erkunder_abbruch_gewuenscht(job_id: Optional[str]) -> bool:
+    """True, wenn fuer diesen Job ein Abbruchwunsch gespeichert ist. Ein Lesefehler stoppt den
+    Lauf nicht (laut geloggt); ohne Job-ID gibt es keinen Wunsch."""
+    if not job_id:
+        return False
+    from src.jobs import store_client
+
+    try:
+        state = await store_client.cancel_state(job_id)
+    except Exception as error:  # noqa: BLE001 - Lesefehler darf den Bericht nicht abbrechen
+        logger.error("erkunder job=%s abbruchwunsch=nicht_lesbar fehler=%s", job_id, type(error).__name__)
+        return False
+    return bool(state and state.get("cancel_requested"))
+
+
 async def erkunder_executor(
     payload: dict,
     attribution: Optional[dict],
@@ -765,6 +780,9 @@ async def erkunder_executor(
     if not token:
         raise RuntimeError("Erkunder: Tokendatei leer")
     url, headers = intern_config()
+    from src.jobs.registry import erkunder_job
+
+    job_id = erkunder_job()
 
     async def run() -> dict:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -828,6 +846,18 @@ async def erkunder_executor(
                     raise RuntimeError(f"erkunder abbruch: {safe_step}: {reason_text}")
                 if state["zustand"] != "laeuft":
                     raise RuntimeError("Erkunder: ungueltiger Zustand")
+                if await _erkunder_abbruch_gewuenscht(job_id):
+                    # Regulaerer Abbruch: Bericht und Plaetze im Leitstand aufraeumen, dann
+                    # endet dieser Poll (kein weiterer /start). Der Leitstand lehnt einen
+                    # erneuten /start derselben ID danach ab (410).
+                    response = await client.post(
+                        f"{url}/aufraeumen/{auftrag.bericht_id}", headers=headers
+                    )
+                    if response.status_code != 200:
+                        raise RuntimeError(
+                            f"Erkunder abbruch: Aufraeumen HTTP {response.status_code}"
+                        )
+                    raise RuntimeError("erkunder abbruch: vom Nutzer abgebrochen")
                 await asyncio.sleep(15)
 
     try:

@@ -238,7 +238,8 @@ def _capacity_retry_delay(exc: "Exception") -> int:
 #
 # Only kinds whose executor is ONE self-call to a supervised endpoint are
 # stopped this way, and only their self-call is marked (JOB_LAUF_HEADER).
-# Every other kind (erkunder: its run lives in the coordinator, not here;
+# Every other kind (erkunder: its run lives in the coordinator, not here; its executor reads the
+# wish itself and tidies the report up, executors._erkunder_abbruch_gewuenscht;
 # ping/proxy/pdf: short, no model — a proxy job calling a chat path stays
 # unmarked) keeps BR10b.
 JOB_ABBRECHBAR_IM_LAUF = frozenset({"chat", "research", "doc-agent"})
@@ -266,6 +267,14 @@ _job_kontext: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
     "bridge_job_kontext", default=None
 )
 JOB_KONTEXT_KINDS = frozenset({"proxy"})
+_erkunder_job: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "bridge_erkunder_job", default=None
+)
+
+
+def erkunder_job() -> Optional[str]:
+    """Id des Erkunder-Jobs, dessen Executor in diesem Task laeuft, sonst None."""
+    return _erkunder_job.get()
 
 
 def kontext_job() -> Optional[str]:
@@ -493,6 +502,14 @@ async def _ausfuehren(
             retryable=False, details={"fehler_code": _abweisung.detail.get("code")},
         )
 
+    if kind == "erkunder":
+        # Der Erkunder-Lauf lebt im Leitstand; der Executor braucht seine Job-ID, um den
+        # Abbruchwunsch (DELETE /v1/jobs/{id}) zu lesen und den Bericht aufzuraeumen.
+        etoken = _erkunder_job.set(job_id)
+        try:
+            return await executor(payload, attribution, report_progress)
+        finally:
+            _erkunder_job.reset(etoken)
     if kind not in JOB_ABBRECHBAR_IM_LAUF or not (attribution or {}).get(EIGENTUEMER_KEY):
         kontext = _kontext_job_fuer(job_id, kind, attribution)
         if kontext is None:
