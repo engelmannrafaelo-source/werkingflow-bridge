@@ -73,6 +73,41 @@ class StepFailed(Exception):
         super().__init__(f"{step}: {reason}")
 
 
+MAX_BERICHTE_VORGABE = 4
+MAX_BERICHTE_GRENZE = 8
+
+
+def max_berichte() -> int:
+    """Hoechstzahl gleichzeitig laufender Berichte EINER Eltern-Kennung (ERKUNDER_MAX_BERICHTE).
+
+    Vorgabe 4. `1` stellt das alte Verhalten her (ein Bericht im Haus). Ein ungueltiger Wert
+    gibt KEINEN stillen Ersatzwert: /start antwortet 503, der Wert selbst wird nie geloggt."""
+    raw = os.environ.get("ERKUNDER_MAX_BERICHTE", "").strip()
+    if not raw:
+        return MAX_BERICHTE_VORGABE
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if not 1 <= value <= MAX_BERICHTE_GRENZE:
+        LOG.error("ERKUNDER_MAX_BERICHTE ungueltig (erlaubt 1..%s); Leitstand nimmt keine Berichte an",
+                  MAX_BERICHTE_GRENZE)
+        raise LeitstandHTTPError(503, "Leitstand-Konfiguration ungueltig")
+    return value
+
+
+def auftrag_fingerabdruck(order: Auftrag) -> str:
+    """Stabiler Fingerabdruck der fachlichen Eingabe (ohne signierte Download-URLs)."""
+    data = order.model_dump(mode="json", by_alias=True)
+    data["dateien"] = sorted(
+        ({"ziel": f["ziel"], "sha256": f["sha256"].lower(), "bytes": f["bytes"]} for f in data["dateien"]),
+        key=lambda f: f["ziel"],
+    )
+    return hashlib.sha256(
+        json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
+
 class Coordinator:
     def __init__(
         self,
@@ -101,6 +136,11 @@ class Coordinator:
         self.token_ready: dict[str, asyncio.Event] = {}
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.lock = asyncio.Lock()
+        # Platzvergabe je Schritt: ein Platz gehoert genau einem Schritt (bericht_id, schritt).
+        self.slot_busy: dict[int, tuple[str, str]] = {}
+        self.slot_cond = asyncio.Condition()
+        # Aufgeraeumte Berichte: ein spaeterer /start derselben ID startet NICHT neu.
+        self.aufgeraeumt: dict[str, float] = {}
         self.startup_lock = asyncio.Lock()
         self.deploy_pending = False
         self.housekeeper: asyncio.Task[None] | None = None
@@ -346,25 +386,69 @@ class Coordinator:
             self.deploy_pending = False
             return {"freigegeben": True}
 
+    async def acquire_slot(self, ident: str, name: str) -> int:
+        async with self.slot_cond:
+            while True:
+                free = [i for i in range(len(self.places)) if i not in self.slot_busy]
+                if free:
+                    self.slot_busy[free[0]] = (ident, name)
+                    return free[0]
+                await self.slot_cond.wait()
+
+    async def release_slot(self, ident: str, name: str, slot: int) -> None:
+        async with self.slot_cond:
+            if self.slot_busy.get(slot) == (ident, name):
+                del self.slot_busy[slot]
+                self.slot_cond.notify_all()
+
     async def start(self, body: Start) -> dict[str, bool]:
         ident = body.auftrag.bericht_id
         async with self.lock:
             if not self.ready:
                 raise LeitstandHTTPError(503, "Leitstand wartet auf bereinigte Plaetze")
+            limit = max_berichte()
+            abbruch_zeit = self.aufgeraeumt.get(ident)
+            if abbruch_zeit is not None:
+                if time.time() - abbruch_zeit < self.retention:
+                    # Laufender Bericht wurde abgebrochen: ein weiterer Poll startet ihn nicht neu.
+                    raise LeitstandHTTPError(410, "bericht_aufgeraeumt")
+                self.aufgeraeumt.pop(ident, None)
             if ident in self.states:
+                fingerabdruck = auftrag_fingerabdruck(body.auftrag)
+                bekannt = self.states[ident].get("fingerabdruck")
+                if bekannt is None:
+                    # Bericht aus der Zeit vor dem Fingerabdruck: einmal nachtragen.
+                    self.states[ident]["fingerabdruck"] = fingerabdruck
+                    LOG.warning("bericht_id=%s fingerabdruck=nachgetragen", ident)
+                    self.save(ident)
+                elif bekannt != fingerabdruck:
+                    raise LeitstandHTTPError(422, "bericht_id_eingabe_abweichend")
                 self.tokens[ident] = body.claude_token
                 self.states[ident]["worker"] = body.worker
                 self.token_ready[ident].set()
                 return {"angehaengt": True}
             if self.deploy_pending:
                 raise LeitstandHTTPError(503, "Leitstand wird ausgerollt")
-            for other, state in self.states.items():
-                if state["zustand"] == "laeuft":
-                    raise HTTPException(409, {"belegt": other})
-            # Gate every new report, including after cleanup removed its state.
-            # Errors propagate; neither a task nor a writable report is created.
-            self.seal_reports()
-            await self.stop_places()
+            laufende = [o for o, st in self.states.items() if st["zustand"] == "laeuft"]
+            if laufende:
+                # Gleichzeitig nur Teile EINER Eltern-Kennung (gleicher Kunde/Lauf): die Plaetze
+                # und Berichtsordner sind fuer sie lesbar, fremde Berichte bleiben getrennt.
+                eltern = body.auftrag.eltern_bericht_id
+                fremd = [
+                    o for o in laufende
+                    if eltern is None or self.states[o]["auftrag"].get("eltern_bericht_id") != eltern
+                ]
+                if fremd:
+                    raise HTTPException(409, {"belegt": fremd[0]})
+                if len(laufende) >= limit:
+                    raise HTTPException(409, {"belegt": laufende[0]})
+            else:
+                # Gate every new report, including after cleanup removed its state.
+                # Errors propagate; neither a task nor a writable report is created.
+                # Mit laufenden Geschwistern NICHT: das wuerde deren Plaetze abbrechen
+                # und ihre Ordner versiegeln.
+                self.seal_reports()
+                await self.stop_places()
             directory = self.directory(ident)
             directory.mkdir(mode=0o711)
             directory.chmod(0o711)
@@ -381,6 +465,7 @@ class Coordinator:
                 "eingang_fertig": False,
                 "erkunder_ausgefallen": [],
                 "korrekturkreis_gelaufen": False,
+                "fingerabdruck": auftrag_fingerabdruck(body.auftrag),
             }
             self.tokens[ident] = body.claude_token
             self.token_ready[ident] = asyncio.Event()
@@ -494,15 +579,18 @@ class Coordinator:
                 if active:
                     slot = active["slot"]
                 else:
-                    if attempts or slot in state.get("unsichere_plaetze", []):
-                        response = await self.client.post(
-                            self.places[slot] + "/abbrechen", headers=self.headers()
-                        )
-                        response.raise_for_status()
-                        state["unsichere_plaetze"] = [
-                            p for p in state.get("unsichere_plaetze", []) if p != slot
-                        ]
                     await self.token_ready[ident].wait()
+                    # Platz je Schritt statt fester Zuordnung: wartet, bis einer frei ist.
+                    slot = await self.acquire_slot(ident, name)
+                    # Jeder Platz wird vor einem neuen Schritt bereinigt und quittiert
+                    # (er kann zuvor einem anderen Bericht/Schritt gedient haben).
+                    response = await self.client.post(
+                        self.places[slot] + "/abbrechen", headers=self.headers()
+                    )
+                    response.raise_for_status()
+                    state["unsichere_plaetze"] = [
+                        p for p in state.get("unsichere_plaetze", []) if p != slot
+                    ]
                     directory = self.directory(ident) / name
                     if directory.exists():
                         if directory.is_symlink():
@@ -565,6 +653,12 @@ class Coordinator:
             except (httpx.HTTPError, KeyError, ValueError):
                 state.setdefault("unsichere_plaetze", []).append(slot)
                 meta = {"status": "abbruch", "abbruch_grund": "platz_neustart"}
+            except Exception:
+                # Platz freigeben; CancelledError (BaseException) bleibt bewusst belegt:
+                # cleanup() gibt ihn erst nach der Platzquittung frei.
+                await self.release_slot(ident, name, slot)
+                raise
+            await self.release_slot(ident, name, slot)
             attempts += 1
             record = {
                 "name": name,
@@ -1015,8 +1109,12 @@ class Coordinator:
                 if state["zustand"] == "laeuft":
                     state["zustand"] = "abbruch"
                     state["fehler"] = "cli_fehler: Aufraeumen angefordert"
+                    # Ein weiterer /start derselben ID (Poll des Workers) darf ihn nicht neu starten.
+                    self.aufgeraeumt[ident] = time.time()
                 slots = {a["slot"] for a in state["active"].values()}
                 slots.update(state.get("unsichere_plaetze", []))
+                # Auch Plaetze, die der abgebrochene Schritt belegt, bevor er sich eintrug.
+                slots.update(p for p, (i, _n) in self.slot_busy.items() if i == ident)
                 for slot in slots:
                     try:
                         response = await self.client.post(
@@ -1024,6 +1122,9 @@ class Coordinator:
                             headers=self.headers(),
                         )
                         response.raise_for_status()
+                        belegt_von = self.slot_busy.get(slot)
+                        if belegt_von and belegt_von[0] == ident:
+                            await self.release_slot(ident, belegt_von[1], slot)
                     except httpx.HTTPError as error:
                         abort_errors.append(
                             {"platz": slot, "fehler": type(error).__name__}
