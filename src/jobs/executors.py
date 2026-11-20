@@ -799,6 +799,18 @@ async def erkunder_executor(
     async def run() -> dict:
         async with httpx.AsyncClient(timeout=60) as client:
             while True:
+                # Abbruchwunsch VOR jedem /start pruefen: ein waehrend der 429-Wartezeit
+                # abgebrochener Job darf keinen neuen Bericht starten (Review H4).
+                if await _erkunder_abbruch_gewuenscht(job_id):
+                    # Der Bericht kann schon existieren (Wiederanhaengen nach Neustart): aufraeumen.
+                    response = await client.post(
+                        f"{url}/aufraeumen/{auftrag.bericht_id}", headers=headers
+                    )
+                    if response.status_code != 200:
+                        raise RuntimeError(
+                            f"Erkunder abbruch: Aufraeumen HTTP {response.status_code}"
+                        )
+                    raise RuntimeError("erkunder abbruch: vom Nutzer abgebrochen")
                 # Reattach even if a fast restart happened between two polls.
                 response = await client.post(
                     f"{url}/start",
