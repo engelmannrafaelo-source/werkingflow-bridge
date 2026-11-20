@@ -220,6 +220,31 @@ Verbrauchswerte wiederholen. Sie sind Beobachtungen, keine additiven Deltas.
 Für die Endsumme gilt ausschließlich das Result (`laufgesamt`), sofern vorhanden.
 
 
+### Mehrere Berichte gleichzeitig (Eltern-Kennung, Platzvergabe je Schritt)
+
+Der Auftrag trägt optional `eltern_bericht_id`. Berichte mit **gleicher** Eltern-Kennung (Teile
+eines Kunden/Laufs) dürfen gleichzeitig laufen, höchstens `ERKUNDER_MAX_BERICHTE` (Vorgabe 4,
+1..8; `1` = altes Verhalten, ein Bericht im Haus; ungültig = 503, der Wert wird nie geloggt).
+Berichte ohne oder mit anderer Kennung laufen nie neben einem laufenden Bericht (409 → Worker
+429 „Erkunder belegt“): Plätze und Berichtsordner sind für Geschwister lesbar, fremde Berichte
+bleiben getrennt. Ein Platz gehört genau einem Schritt (Queue, kein Halten-und-Warten) und
+wird vor jedem Schritt per `/abbrechen` bereinigt und quittiert. Die drei Erkunder eines
+Berichts laufen immer auf verschiedenen Plätzen (UIDs), sonst wären sie nicht unabhängig.
+Es laufen weiter höchstens so viele Schritte gleichzeitig, wie es Plätze gibt (3).
+
+`/start` mit bekannter `bericht_id` und anderer fachlicher Eingabe (Fingerabdruck über
+Gegenstand, Datenstand, Auftrag, Zweck, Vorwissen, Vertiefung, Korrekturkreis, Prüfliste,
+Modell, Eltern-Kennung und Dateien nach Ziel/sha256/Größe ohne URL) liefert 422
+`bericht_id_eingabe_abweichend` und hängt nichts an. Berichte aus der Zeit davor erhalten den
+Fingerabdruck beim ersten Anhängen einmalig nachgetragen (Logzeile `fingerabdruck=nachgetragen`).
+
+Abbruch: `DELETE /v1/jobs/{id}` auf einen laufenden Erkunder-Job wird vom Executor im Poll
+gelesen; er ruft `POST /aufraeumen/{bericht_id}` (Task abbrechen, Plätze quittiert freigeben)
+und beendet den Poll. Ein erneuter `/start` derselben ID antwortet danach 410
+`bericht_aufgeraeumt` (Retention, nur im Speicher; ein Leitstand-Neustart vergisst die Marke).
+Rückfall: `ERKUNDER_MAX_BERICHTE=1` und Leitstand-Neustart; Worker, die keine Eltern-Kennung
+senden, verhalten sich wie bisher.
+
 ### Aktivitätsüberwachung statt Schritt-/Job-Wanduhr
 
 `ERKUNDER_STILLE_S` ist ein positiver, endlicher Bridge-Betriebsparameter der

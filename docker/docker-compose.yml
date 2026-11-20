@@ -1017,6 +1017,8 @@ services:
     memswap_limit: 1g
     environment:
       ERKUNDER_INTERNAL_TOKEN: ${ERKUNDER_INTERNAL_TOKEN:-}
+      # Gleichzeitig laufende Berichte EINER Eltern-Kennung (1..8). 1 = altes Verhalten.
+      ERKUNDER_MAX_BERICHTE: ${ERKUNDER_MAX_BERICHTE:-4}
     volumes:
       - erkunder-arbeit:/arbeit
     networks: [bridge-net, erkunder-intern]
