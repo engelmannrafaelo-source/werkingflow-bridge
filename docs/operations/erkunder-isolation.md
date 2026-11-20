@@ -246,11 +246,16 @@ Auslieferungsreihenfolge: erst Leitstand-Image, dann ALLE Worker, erst danach da
 `eltern_bericht_id` senden (ältere Leitstände weisen das Feld mit 400, ältere Worker schon bei
 der Annahme ab). Ohne Kennung ist alles abwärtskompatibel.
 
-Vertrauensannahme: Die Eltern-Kennung setzt der Aufrufer (ein für Erkunder freigegebener
-Schlüssel, `zugang.py`); sie ist nicht an Attribution/Mandant gebunden. Gleichzeitig laufende
-Berichte teilen Plätze und sind füreinander lesbar. Die Kennung muss deshalb pro Kunde/Lauf
-eindeutig und nicht erratbar sein (Energy: stabile Basis-ID des Projekts). Eine Bindung an die
-Attribution ist ein möglicher Folgeschritt.
+Kundentrennung: Die Eltern-Kennung setzt der Aufrufer selbst und ist allein keine Grenze. Der
+Worker sendet deshalb zusätzlich den Eigentümer-Digest des Jobs (Principal, App und Nutzer; aus
+der serverseitig gestempelten Job-Attribution, nie aus dem Auftrag). Gleichzeitig laufen nur
+Berichte mit gleicher Eltern-Kennung UND gleichem Eigentümer; fehlt einer von beiden (auch bei
+beiden Berichten), läuft der Bericht allein wie bisher (409). Ein fremder Eigentümer, der eine
+bekannte `bericht_id` nennt, bekommt 403 `bericht_id_fremder_eigentuemer`. Das Feld
+`eigentuemer` des Starts wird wie `eltern_bericht_id` nur gesendet, wenn eine Eltern-Kennung
+gesetzt ist (ältere Leitstände kennen es nicht; gleiche Auslieferungsreihenfolge). Grenze: Unter
+dem gemeinsamen Worker-Schlüssel behauptet der Aufrufer App und Nutzer selbst (bekannte Grenze
+von `_idempotency_owner`); mit Principals ist der Principal-Name Teil des Digests.
 
 Platzfreigabe: Ein gescheitertes `/abbrechen` beim Aufräumen sperrt den Platz nicht dauerhaft
 (jeder Schritt bereinigt und quittiert seinen Platz vor dem Start); Wartende Berichte erneuern
