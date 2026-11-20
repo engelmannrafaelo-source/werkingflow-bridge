@@ -1151,107 +1151,127 @@ class Coordinator:
             if path.exists() and not spaeter_versiegeln:
                 self.seal(ident)
             abort_errors: list[dict[str, Any]] = []
-            task = self.tasks.pop(ident, None)
-            if task:
-                if spaeter_versiegeln:
-                    self.aufraeumen_laeuft.add(ident)
-                try:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-                finally:
-                    self.aufraeumen_laeuft.discard(ident)
-            if state:
-                if state["zustand"] == "laeuft":
-                    state["zustand"] = "abbruch"
-                    state["fehler"] = "cli_fehler: Aufraeumen angefordert"
-                    # Ein weiterer /start derselben ID (Poll des Workers) darf ihn nicht neu starten.
-                    self.aufgeraeumt[ident] = time.time()
-                slots = {a["slot"] for a in state["active"].values()}
-                slots.update(state.get("unsichere_plaetze", []))
-                # Auch Plaetze, die der abgebrochene Schritt belegt, bevor er sich eintrug.
-                slots.update(p for p, (i, _n) in self.slot_busy.items() if i == ident)
-                for slot in sorted(slots):
-                    async with self.slot_cond:
-                        fremd = self.slot_busy.get(slot)
-                        ueberspringen = bool(fremd and fremd[0] != ident)
-                        # Freien Platz waehrend des /abbrechen halten: sonst koennte ein
-                        # Geschwisterschritt ihn zwischen Pruefung und Aufruf belegen und
-                        # wuerde von diesem /abbrechen getroffen.
-                        gehalten = fremd is None
-                        if gehalten:
-                            self.slot_busy[slot] = (ident, "__aufraeumen__")
-                    if ueberspringen:
-                        # Platz gehoert dem Schritt eines anderen Berichts: ein /abbrechen
-                        # wuerde diesen treffen. step() bereinigt vor jeder Nutzung.
-                        continue
+            seal_fehler = False
+            try:
+                task = self.tasks.pop(ident, None)
+                if task:
+                    if spaeter_versiegeln:
+                        self.aufraeumen_laeuft.add(ident)
                     try:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    finally:
+                        self.aufraeumen_laeuft.discard(ident)
+                if state:
+                    if state["zustand"] == "laeuft":
+                        state["zustand"] = "abbruch"
+                        state["fehler"] = "cli_fehler: Aufraeumen angefordert"
+                        # Ein weiterer /start derselben ID (Poll des Workers) darf ihn nicht neu starten.
+                        self.aufgeraeumt[ident] = time.time()
+                    slots = {a["slot"] for a in state["active"].values()}
+                    slots.update(state.get("unsichere_plaetze", []))
+                    # Auch Plaetze, die der abgebrochene Schritt belegt, bevor er sich eintrug.
+                    slots.update(p for p, (i, _n) in self.slot_busy.items() if i == ident)
+                    for slot in sorted(slots):
+                        async with self.slot_cond:
+                            fremd = self.slot_busy.get(slot)
+                            ueberspringen = bool(fremd and fremd[0] != ident)
+                            # Freien Platz waehrend des /abbrechen halten: sonst koennte ein
+                            # Geschwisterschritt ihn zwischen Pruefung und Aufruf belegen und
+                            # wuerde von diesem /abbrechen getroffen.
+                            gehalten = fremd is None
+                            if gehalten:
+                                self.slot_busy[slot] = (ident, "__aufraeumen__")
+                        if ueberspringen:
+                            # Platz gehoert dem Schritt eines anderen Berichts: ein /abbrechen
+                            # wuerde diesen treffen. step() bereinigt vor jeder Nutzung.
+                            continue
                         try:
-                            response = await self.client.post(
-                                self.places[slot] + "/abbrechen",
-                                headers=self.headers(),
+                            try:
+                                response = await self.client.post(
+                                    self.places[slot] + "/abbrechen",
+                                    headers=self.headers(),
+                                )
+                                response.raise_for_status()
+                            finally:
+                                if gehalten:
+                                    await self.release_slot(ident, "__aufraeumen__", slot)
+                            belegt_von = self.slot_busy.get(slot)
+                            if belegt_von and belegt_von[0] == ident:
+                                await self.release_slot(ident, belegt_von[1], slot)
+                        except httpx.HTTPError as error:
+                            # Platz bleibt unsicher, wird aber nicht dauerhaft gesperrt: jeder Schritt
+                            # bereinigt und quittiert seinen Platz vor dem Start (raise_for_status).
+                            belegt_von = self.slot_busy.get(slot)
+                            if belegt_von and belegt_von[0] == ident:
+                                await self.release_slot(ident, belegt_von[1], slot)
+                            abort_errors.append(
+                                {"platz": slot, "fehler": type(error).__name__}
+                            )
+                            LOG.error(
+                                "bericht_id=%s platz=%s abbrechen=fehlgeschlagen fehler=%s",
+                                ident,
+                                slot,
+                                type(error).__name__,
+                            )
+                    # Place state is volatile. After a restart/failed stop, retain
+                    # the uncertainty, not the customer files. start() still gates
+                    # every new report on stop_places().
+                    for name, active in list(state["active"].items()):
+                        meta = {"status": "abbruch", "abbruch_grund": "cli_fehler: Aufraeumen angefordert"}
+                        try:
+                            response = await self.client.get(
+                                f"{self.places[active['slot']]}/schritt/{ident}/{name}", headers=self.headers(),
                             )
                             response.raise_for_status()
-                        finally:
-                            if gehalten:
-                                await self.release_slot(ident, "__aufraeumen__", slot)
-                        belegt_von = self.slot_busy.get(slot)
-                        if belegt_von and belegt_von[0] == ident:
-                            await self.release_slot(ident, belegt_von[1], slot)
-                    except httpx.HTTPError as error:
-                        # Platz bleibt unsicher, wird aber nicht dauerhaft gesperrt: jeder Schritt
-                        # bereinigt und quittiert seinen Platz vor dem Start (raise_for_status).
-                        belegt_von = self.slot_busy.get(slot)
-                        if belegt_von and belegt_von[0] == ident:
-                            await self.release_slot(ident, belegt_von[1], slot)
-                        abort_errors.append(
-                            {"platz": slot, "fehler": type(error).__name__}
-                        )
-                        LOG.error(
-                            "bericht_id=%s platz=%s abbrechen=fehlgeschlagen fehler=%s",
-                            ident,
-                            slot,
-                            type(error).__name__,
-                        )
-                if spaeter_versiegeln and path.exists():
-                    self.seal(ident)
-                # Place state is volatile. After a restart/failed stop, retain
-                # the uncertainty, not the customer files. start() still gates
-                # every new report on stop_places().
-                for name, active in list(state["active"].items()):
-                    meta = {"status": "abbruch", "abbruch_grund": "cli_fehler: Aufraeumen angefordert"}
+                            final = response.json()
+                            if final.get("zustand") != "laeuft" and isinstance(final.get("meta"), dict):
+                                meta = final["meta"]
+                        except (httpx.HTTPError, ValueError, AttributeError) as error:
+                            meta["abbruch_grund"] = "platz_neustart"
+                            LOG.error("bericht_id=%s schrittdiagnose=unbestaetigt fehler=%s", ident, type(error).__name__)
+                        state["schritte"].append({
+                            "name": name, "versuch": 1 + sum(s["name"] == name for s in state["schritte"]),
+                            "status": meta.get("status", "abbruch"),
+                            "abbruch_grund": safe_reason(meta.get("abbruch_grund")),
+                            "diagnose": details(meta.get("diagnose")),
+                            "sdk": snapshot(meta.get("sdk", active.get("sdk"))),
+                        })
+                        state["active"].pop(name, None)
+                    state.setdefault("lauf_start", time.time_ns())
+                    # Retaining the source is useful for restart recovery, but a
+                    # failed source write must not defeat successful archival.
                     try:
-                        response = await self.client.get(
-                            f"{self.places[active['slot']]}/schritt/{ident}/{name}", headers=self.headers(),
-                        )
-                        response.raise_for_status()
-                        final = response.json()
-                        if final.get("zustand") != "laeuft" and isinstance(final.get("meta"), dict):
-                            meta = final["meta"]
-                    except (httpx.HTTPError, ValueError, AttributeError) as error:
-                        meta["abbruch_grund"] = "platz_neustart"
-                        LOG.error("bericht_id=%s schrittdiagnose=unbestaetigt fehler=%s", ident, type(error).__name__)
-                    state["schritte"].append({
-                        "name": name, "versuch": 1 + sum(s["name"] == name for s in state["schritte"]),
-                        "status": meta.get("status", "abbruch"),
-                        "abbruch_grund": safe_reason(meta.get("abbruch_grund")),
-                        "diagnose": details(meta.get("diagnose")),
-                        "sdk": snapshot(meta.get("sdk", active.get("sdk"))),
-                    })
-                    state["active"].pop(name, None)
-                state.setdefault("lauf_start", time.time_ns())
-                # Retaining the source is useful for restart recovery, but a
-                # failed source write must not defeat successful archival.
-                try:
-                    self.save(ident)
-                except OSError as error:
-                    LOG.error("bericht_id=%s laufspeicherung=fehlgeschlagen fehler=%s", ident, type(error).__name__)
-                try:
-                    evidence = self.archive_diagnostics(ident)
-                except Exception as error:
-                    LOG.error("bericht_id=%s diagnosearchiv=fehlgeschlagen fehler=%s", ident, type(error).__name__)
-                    raise LeitstandHTTPError(503, "Aufraeumen verweigert: Diagnosearchiv nicht gesichert") from error
-                LOG.info("bericht_id=%s gesicherte_schrittdiagnosen=%s", ident,
-                         json.dumps(evidence["schritte"], ensure_ascii=False))
+                        self.save(ident)
+                    except OSError as error:
+                        LOG.error("bericht_id=%s laufspeicherung=fehlgeschlagen fehler=%s", ident, type(error).__name__)
+                    try:
+                        evidence = self.archive_diagnostics(ident)
+                    except Exception as error:
+                        LOG.error("bericht_id=%s diagnosearchiv=fehlgeschlagen fehler=%s", ident, type(error).__name__)
+                        raise LeitstandHTTPError(503, "Aufraeumen verweigert: Diagnosearchiv nicht gesichert") from error
+                    LOG.info("bericht_id=%s gesicherte_schrittdiagnosen=%s", ident,
+                             json.dumps(evidence["schritte"], ensure_ascii=False))
+            finally:
+                # Ein LAUFENDER Bericht wurde bis hierher nicht versiegelt (der Platz braucht den Zugriff
+                # fuer sein Aufraeumen). Das Versiegeln muss JEDEN Ausgang nach dem Task-Abbruch
+                # ueberleben, auch eine Ausnahme im Platz-Loop oder in release_slot: sonst bliebe der
+                # Ordner fuer die Platz-UIDs lesbar (Kundentrennung).
+                if spaeter_versiegeln and path.exists():
+                    try:
+                        self.seal(ident)
+                    except Exception as error:  # noqa: BLE001 - laut melden, Bericht auf abbruch
+                        seal_fehler = True
+                        LOG.error("bericht_id=%s rechteentzug=fehlgeschlagen fehler=%s", ident, type(error).__name__)
+                        if state is not None:
+                            state["zustand"] = "abbruch"
+                            state["fehler"] = "Bericht-Trennung: Rechteentzug fehlgeschlagen"
+                            try:
+                                self.save(ident)
+                            except OSError:
+                                pass
+            if seal_fehler:
+                raise LeitstandHTTPError(503, "Bericht-Trennung: Rechteentzug fehlgeschlagen")
             size = None
             try:
                 size = (
