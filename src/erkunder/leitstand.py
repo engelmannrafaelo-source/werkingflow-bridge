@@ -142,6 +142,7 @@ class Coordinator:
         self.lock = asyncio.Lock()
         # Platzvergabe je Schritt: ein Platz gehoert genau einem Schritt (bericht_id, schritt).
         self.slot_busy: dict[int, tuple[str, str]] = {}
+        self.aufraeumen_laeuft: set[str] = set()
         self.slot_cond = asyncio.Condition()
         self.slot_wait_s = 60.0  # Wartende erneuern so oft ihre Aktivitaet
         # Aufgeraeumte Berichte: ein spaeterer /start derselben ID startet NICHT neu.
@@ -787,7 +788,11 @@ class Coordinator:
             # No await between completion and revocation. The entire retained
             # report is now root-only, including inputs, scripts and results.
             try:
-                self.seal(ident)
+                # cleanup() versiegelt selbst, aber erst NACH dem quittierten /abbrechen (sonst
+                # scheitert das Platz-Aufraeumen mit PermissionError, der Platz gaebe danach dauerhaft
+                # 503). Jeder andere Abbruch (z. B. shutdown) versiegelt wie bisher sofort.
+                if ident not in self.aufraeumen_laeuft:
+                    self.seal(ident)
             except Exception as error:
                 state["zustand"] = "abbruch"
                 state["fehler"] = "Bericht-Trennung: Rechteentzug fehlgeschlagen"
@@ -1137,13 +1142,24 @@ class Coordinator:
                     state = {"zustand": "ohne_laufdiagnose", "schritte": [], "active": {}}
                 self.states[ident] = state
                 self.token_ready.setdefault(ident, asyncio.Event())
-            if path.exists():
+            # Ein LAUFENDER Bericht wird erst NACH dem quittierten /abbrechen versiegelt: sein Platz
+            # raeumt das Schrittverzeichnis selbst auf und braucht dafuer den Zugriff auf den
+            # Berichtsordner. Frueher (Versiegeln zuerst) scheiterte dieses Aufraeumen mit
+            # PermissionError, der Platz antwortete danach dauerhaft 503 und kein neuer Bericht wurde
+            # mehr angenommen (belegt an Basis a52b579 und Kandidat, Abnahme Stufe 2).
+            spaeter_versiegeln = bool(state and state.get("zustand") == "laeuft")
+            if path.exists() and not spaeter_versiegeln:
                 self.seal(ident)
             abort_errors: list[dict[str, Any]] = []
             task = self.tasks.pop(ident, None)
             if task:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                if spaeter_versiegeln:
+                    self.aufraeumen_laeuft.add(ident)
+                try:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                finally:
+                    self.aufraeumen_laeuft.discard(ident)
             if state:
                 if state["zustand"] == "laeuft":
                     state["zustand"] = "abbruch"
@@ -1196,6 +1212,8 @@ class Coordinator:
                             slot,
                             type(error).__name__,
                         )
+                if spaeter_versiegeln and path.exists():
+                    self.seal(ident)
                 # Place state is volatile. After a restart/failed stop, retain
                 # the uncertainty, not the customer files. start() still gates
                 # every new report on stop_places().
