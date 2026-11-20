@@ -1155,17 +1155,29 @@ class Coordinator:
                 # Auch Plaetze, die der abgebrochene Schritt belegt, bevor er sich eintrug.
                 slots.update(p for p, (i, _n) in self.slot_busy.items() if i == ident)
                 for slot in sorted(slots):
-                    fremd = self.slot_busy.get(slot)
-                    if fremd and fremd[0] != ident:
-                        # Platz gehoert inzwischen dem Schritt eines anderen Berichts:
-                        # ein /abbrechen wuerde diesen treffen. step() bereinigt vor jeder Nutzung.
+                    async with self.slot_cond:
+                        fremd = self.slot_busy.get(slot)
+                        ueberspringen = bool(fremd and fremd[0] != ident)
+                        # Freien Platz waehrend des /abbrechen halten: sonst koennte ein
+                        # Geschwisterschritt ihn zwischen Pruefung und Aufruf belegen und
+                        # wuerde von diesem /abbrechen getroffen.
+                        gehalten = fremd is None
+                        if gehalten:
+                            self.slot_busy[slot] = (ident, "__aufraeumen__")
+                    if ueberspringen:
+                        # Platz gehoert dem Schritt eines anderen Berichts: ein /abbrechen
+                        # wuerde diesen treffen. step() bereinigt vor jeder Nutzung.
                         continue
                     try:
-                        response = await self.client.post(
-                            self.places[slot] + "/abbrechen",
-                            headers=self.headers(),
-                        )
-                        response.raise_for_status()
+                        try:
+                            response = await self.client.post(
+                                self.places[slot] + "/abbrechen",
+                                headers=self.headers(),
+                            )
+                            response.raise_for_status()
+                        finally:
+                            if gehalten:
+                                await self.release_slot(ident, "__aufraeumen__", slot)
                         belegt_von = self.slot_busy.get(slot)
                         if belegt_von and belegt_von[0] == ident:
                             await self.release_slot(ident, belegt_von[1], slot)

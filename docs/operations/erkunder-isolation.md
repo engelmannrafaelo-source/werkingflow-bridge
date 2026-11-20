@@ -251,7 +251,9 @@ Worker sendet deshalb zusätzlich den Eigentümer-Digest des Jobs (Principal, Ap
 der serverseitig gestempelten Job-Attribution, nie aus dem Auftrag). Gleichzeitig laufen nur
 Berichte mit gleicher Eltern-Kennung UND gleichem Eigentümer; fehlt einer von beiden (auch bei
 beiden Berichten), läuft der Bericht allein wie bisher (409). Ein fremder Eigentümer, der eine
-bekannte `bericht_id` nennt, bekommt 403 `bericht_id_fremder_eigentuemer`. Das Feld
+bekannte `bericht_id` eines Berichts MIT Eigentümer-Digest nennt, bekommt 403
+`bericht_id_fremder_eigentuemer` (Berichte ohne Eltern-Kennung tragen keinen Digest und sind
+davon nicht erfasst). Das Feld
 `eigentuemer` des Starts wird wie `eltern_bericht_id` nur gesendet, wenn eine Eltern-Kennung
 gesetzt ist (ältere Leitstände kennen es nicht; gleiche Auslieferungsreihenfolge). Grenze: Unter
 dem gemeinsamen Worker-Schlüssel behauptet der Aufrufer App und Nutzer selbst (bekannte Grenze
