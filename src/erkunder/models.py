@@ -73,6 +73,10 @@ class Auftrag(Vertrag):
     korrekturkreis: int = Field(ge=1, le=5, strict=True)
     pruefliste: list[Pruefpunkt] = Field(default_factory=list)
     modell: ModellName = VORGABE_MODELL
+    # Gemeinsame Kennung zusammengehoeriger Teilberichte EINES Kunden/Laufs. Nur Berichte mit
+    # gleicher Eltern-Kennung duerfen im Leitstand gleichzeitig laufen (sie teilen die Plaetze
+    # und sehen einander). Ohne Angabe laeuft der Bericht allein im Haus (heutiges Verhalten).
+    eltern_bericht_id: BerichtId | None = None
 
 
 class Tokens(Vertrag):

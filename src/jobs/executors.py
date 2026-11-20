@@ -776,7 +776,12 @@ async def erkunder_executor(
                     json={
                         "worker": os.environ.get("INSTANCE_NAME", "unknown"),
                         "claude_token": token,
-                        "auftrag": auftrag.model_dump(mode="json", by_alias=True),
+                        # Ohne Eltern-Kennung das Feld weglassen: ein aelterer Leitstand
+                        # (extra=forbid) kennt es nicht.
+                        "auftrag": auftrag.model_dump(
+                            mode="json", by_alias=True,
+                            exclude=(set() if auftrag.eltern_bericht_id else {"eltern_bericht_id"}),
+                        ),
                     },
                 )
                 if response.status_code in {502, 503, 504}:
