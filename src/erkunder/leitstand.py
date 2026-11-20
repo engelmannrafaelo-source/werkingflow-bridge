@@ -139,6 +139,7 @@ class Coordinator:
         # Platzvergabe je Schritt: ein Platz gehoert genau einem Schritt (bericht_id, schritt).
         self.slot_busy: dict[int, tuple[str, str]] = {}
         self.slot_cond = asyncio.Condition()
+        self.slot_wait_s = 60.0  # Wartende erneuern so oft ihre Aktivitaet
         # Aufgeraeumte Berichte: ein spaeterer /start derselben ID startet NICHT neu.
         self.aufgeraeumt: dict[str, float] = {}
         self.startup_lock = asyncio.Lock()
@@ -387,7 +388,7 @@ class Coordinator:
             return {"freigegeben": True}
 
     async def acquire_slot(self, ident: str, name: str, state: dict[str, Any]) -> int:
-        """Freien Platz belegen (FIFO-nah ueber die Condition, ein Schritt = ein Platz).
+        """Freien Platz belegen (ein Schritt = ein Platz; kein striktes FIFO, Wartende werden reihum geweckt).
 
         Die drei Erkunder eines Berichts muessen auf verschiedenen Plaetzen/UIDs laufen, sonst
         koennte einer die Ergebnisse der anderen lesen und waere nicht unabhaengig. Die
@@ -407,7 +408,12 @@ class Coordinator:
                     if name.startswith("erkunder-"):
                         state.setdefault("erkunder_plaetze", {})[name] = free[0]
                     return free[0]
-                await self.slot_cond.wait()
+                # Wartende Berichte sind aktiv (sonst raeumt sie reap() nach der Retention ab).
+                state["aktivitaet"] = time.time()
+                try:
+                    await asyncio.wait_for(self.slot_cond.wait(), timeout=self.slot_wait_s)
+                except asyncio.TimeoutError:
+                    pass
 
     async def release_slot(self, ident: str, name: str, slot: int) -> None:
         async with self.slot_cond:
@@ -420,7 +426,6 @@ class Coordinator:
         async with self.lock:
             if not self.ready:
                 raise LeitstandHTTPError(503, "Leitstand wartet auf bereinigte Plaetze")
-            limit = max_berichte()
             abbruch_zeit = self.aufgeraeumt.get(ident)
             if abbruch_zeit is not None:
                 if time.time() - abbruch_zeit < self.retention:
@@ -443,6 +448,7 @@ class Coordinator:
                 return {"angehaengt": True}
             if self.deploy_pending:
                 raise LeitstandHTTPError(503, "Leitstand wird ausgerollt")
+            limit = max_berichte()
             laufende = [o for o, st in self.states.items() if st["zustand"] == "laeuft"]
             if laufende:
                 # Gleichzeitig nur Teile EINER Eltern-Kennung (gleicher Kunde/Lauf): die Plaetze
@@ -463,6 +469,11 @@ class Coordinator:
                 # und ihre Ordner versiegeln.
                 self.seal_reports()
                 await self.stop_places()
+                # Kein Bericht laeuft und jeder Platz hat quittiert: Besitzreste (z. B. nach
+                # gescheitertem Aufraeumen) duerfen keinen Platz dauerhaft sperren.
+                async with self.slot_cond:
+                    self.slot_busy.clear()
+                    self.slot_cond.notify_all()
             directory = self.directory(ident)
             directory.mkdir(mode=0o711)
             directory.chmod(0o711)
@@ -1129,7 +1140,12 @@ class Coordinator:
                 slots.update(state.get("unsichere_plaetze", []))
                 # Auch Plaetze, die der abgebrochene Schritt belegt, bevor er sich eintrug.
                 slots.update(p for p, (i, _n) in self.slot_busy.items() if i == ident)
-                for slot in slots:
+                for slot in sorted(slots):
+                    fremd = self.slot_busy.get(slot)
+                    if fremd and fremd[0] != ident:
+                        # Platz gehoert inzwischen dem Schritt eines anderen Berichts:
+                        # ein /abbrechen wuerde diesen treffen. step() bereinigt vor jeder Nutzung.
+                        continue
                     try:
                         response = await self.client.post(
                             self.places[slot] + "/abbrechen",
@@ -1140,6 +1156,11 @@ class Coordinator:
                         if belegt_von and belegt_von[0] == ident:
                             await self.release_slot(ident, belegt_von[1], slot)
                     except httpx.HTTPError as error:
+                        # Platz bleibt unsicher, wird aber nicht dauerhaft gesperrt: jeder Schritt
+                        # bereinigt und quittiert seinen Platz vor dem Start (raise_for_status).
+                        belegt_von = self.slot_busy.get(slot)
+                        if belegt_von and belegt_von[0] == ident:
+                            await self.release_slot(ident, belegt_von[1], slot)
                         abort_errors.append(
                             {"platz": slot, "fehler": type(error).__name__}
                         )

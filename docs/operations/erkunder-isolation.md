@@ -242,6 +242,20 @@ Abbruch: `DELETE /v1/jobs/{id}` auf einen laufenden Erkunder-Job wird vom Execut
 gelesen; er ruft `POST /aufraeumen/{bericht_id}` (Task abbrechen, Plätze quittiert freigeben)
 und beendet den Poll. Ein erneuter `/start` derselben ID antwortet danach 410
 `bericht_aufgeraeumt` (Retention, nur im Speicher; ein Leitstand-Neustart vergisst die Marke).
+Auslieferungsreihenfolge: erst Leitstand-Image, dann ALLE Worker, erst danach darf die App
+`eltern_bericht_id` senden (ältere Leitstände weisen das Feld mit 400, ältere Worker schon bei
+der Annahme ab). Ohne Kennung ist alles abwärtskompatibel.
+
+Vertrauensannahme: Die Eltern-Kennung setzt der Aufrufer (ein für Erkunder freigegebener
+Schlüssel, `zugang.py`); sie ist nicht an Attribution/Mandant gebunden. Gleichzeitig laufende
+Berichte teilen Plätze und sind füreinander lesbar. Die Kennung muss deshalb pro Kunde/Lauf
+eindeutig und nicht erratbar sein (Energy: stabile Basis-ID des Projekts). Eine Bindung an die
+Attribution ist ein möglicher Folgeschritt.
+
+Platzfreigabe: Ein gescheitertes `/abbrechen` beim Aufräumen sperrt den Platz nicht dauerhaft
+(jeder Schritt bereinigt und quittiert seinen Platz vor dem Start); Wartende Berichte erneuern
+ihre Aktivität, damit der Hausmeister sie nicht räumt.
+
 Rückfall: `ERKUNDER_MAX_BERICHTE=1` und Leitstand-Neustart; Worker, die keine Eltern-Kennung
 senden, verhalten sich wie bisher.
 
