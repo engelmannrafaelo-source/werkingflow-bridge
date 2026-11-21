@@ -23,3 +23,9 @@ schema-generator-dev
 # Auf Prod gibt es einen eigenen Principal (principals-prod-only.txt); ein Dev-Schluessel darf dort nie gueltig werden.
 homepage-mini-schema-dev
 homepage-mini-schema-public
+
+# Rafael-Recherche Fix B (20.11.2026): Dev-Principal fuer die Dev-Bridge. Der Sync (Phase 3.6, 21.11. 12:52Z)
+# hat ihn versehentlich auf Prod kopiert (SEC 21.11.: dev-only, Prod-Zeile nach G7 koordiniert DEAKTIVIEREN,
+# nicht loeschen, Dev nicht rotieren). Mit diesem Eintrag kopiert der Sync ihn nie wieder auf einen anderen Host;
+# bis die Prod-Zeile deaktiviert ist, meldet der Drift-Check sie laut (DEV-ONLY PRINCIPAL ACTIVE ON ...).
+rafael-recherche-dev
