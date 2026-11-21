@@ -649,22 +649,39 @@ async def _post_messages_gestreamt(url: str, headers: Dict[str, str], request_bo
     # (BRIDGE_CHAT_JOB_TIMEOUT_S, Compose 2400 s), damit der Endpunkt zuerst laut antwortet.
     timeout = min(timeout, STREAM_GESAMTFRIST_S)
 
+    # G-7e (Review e8511fe6 N-1): ab empfangener 200 ist der Lauf bezahlt. Jeder Abbruch DANACH (error-Ereignis,
+    # fehlendes message_stop, Leitungsabbruch, Frist) wird wie im Nicht-Stream-Weg (BR9f) als nicht wiederholbar
+    # gemeldet (UpstreamResponseUnreadable -> 422), damit weder nginx (/__schema_local, tries 4) noch der
+    # LB-Umweg denselben bezahlten 128k-Lauf erneut senden. Fehler VOR der 200 bleiben wiederholbar.
+    nach_200 = False
+
     async def _lauf() -> "_GestreamteAntwort":
+        nonlocal nach_200
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", url, headers=headers, json=body) as antwort:
                 if antwort.status_code != 200:
                     roh = await antwort.aread()
                     return _GestreamteAntwort(antwort.status_code, antwort.headers, None,
                                               roh.decode("utf-8", "replace"))
+                nach_200 = True
                 zeilen = [z async for z in antwort.aiter_lines()]
                 daten = _stream_zusammensetzen(zeilen)
                 import json as _json
                 return _GestreamteAntwort(200, antwort.headers, daten, _json.dumps(daten))
 
+    from src.middleware.bridge_error import UNREADABLE_RESPONSE_ERRORS, UpstreamResponseUnreadable
+
     try:
         return await asyncio.wait_for(_lauf(), timeout=timeout)
     except asyncio.TimeoutError as e:
+        if nach_200:
+            raise UpstreamResponseUnreadable(
+                "anthropic", httpx.ReadTimeout(f"Anthropic-Stream: Frist {timeout:.0f} s nach Antwortbeginn")) from e
         raise httpx.ReadTimeout(f"Anthropic-Stream: keine vollstaendige Antwort binnen {timeout:.0f} s") from e
+    except (StreamAbbruch, httpx.HTTPError) + UNREADABLE_RESPONSE_ERRORS as e:
+        if nach_200:
+            raise UpstreamResponseUnreadable("anthropic", e) from e
+        raise
 
 
 def _request_id_aus(response: Any) -> Optional[str]:
