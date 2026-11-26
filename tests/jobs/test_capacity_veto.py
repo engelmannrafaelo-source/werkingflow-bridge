@@ -112,6 +112,27 @@ def test_locked_worker_retry_after_floor_is_60s(client):
     assert resp.headers.get("Retry-After") == "60"
 
 
+def test_locked_worker_accepts_gemini_vision_chat_job(client):
+    en1, en2 = _enabled_patches()
+    create = AsyncMock()
+    with (
+        _auth_patch(), en1, en2,
+        patch("src.jobs.routes.get_executor", return_value=lambda: None),
+        patch("src.middleware.capacity_lock.get_capacity_lock",
+              return_value=_locked_cap_lock(remaining=900)),
+        patch("src.jobs.store_client.create_job", create),
+        patch("src.jobs.routes.spawn") as spawn,
+    ):
+        resp = client.post("/v1/jobs", json={
+            "kind": "chat",
+            "payload": {"provider_tier": "gemini-vision"},
+        })
+
+    assert resp.status_code == 200
+    create.assert_awaited_once()
+    spawn.assert_called_once()
+
+
 def test_unlocked_worker_accepts_and_dispatches(client):
     en1, en2 = _enabled_patches()
     create = AsyncMock()

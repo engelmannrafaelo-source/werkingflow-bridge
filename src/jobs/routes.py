@@ -341,6 +341,11 @@ async def _job_runs_off_pool(
     and is caught below like any other probe failure: the veto stays, and the
     caller meets the same refusal again inside the job, where it belongs.
     """
+    payload = body.payload or {}
+    if body.kind == "chat":
+        from src.routing.app_provider_policy import GEMINI_VISION_TEST_TIER
+
+        return payload.get("provider_tier") == GEMINI_VISION_TEST_TIER
     if body.kind != "research":
         return False
     try:
@@ -350,7 +355,6 @@ async def _job_runs_off_pool(
         # attribution.user_id as X-User-ID), so this decision and the one the
         # research handler makes inside the job agree by construction.
         user_id = (attribution or {}).get("user_id")
-        payload = body.payload or {}
         return await resolve_research_cloud_routing(
             user_id, bool(payload.get("cloud_overflow"))
         )
