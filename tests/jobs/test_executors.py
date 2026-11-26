@@ -86,6 +86,23 @@ async def test_chat_executor_success_forces_nonstream_and_propagates():
     assert any(p.get("phase") == "llm" for p in progress)
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"messages": [], "provider_tier": "gemini-vision"}, "gemini"),
+        ({"messages": []}, None),
+        ({"messages": [], "provider_tier": "claude-direct-notools"}, None),
+    ],
+)
+async def test_chat_executor_restores_vision_provider_header_for_gemini_job_only(payload, expected):
+    fake = _FakeClient(_FakeResp(200, {"ok": True}))
+    with patch("httpx.AsyncClient", return_value=fake), \
+         patch("src.auth.auth_manager.get_api_key", return_value="k"):
+        await chat_executor(payload, {"app_id": "werking-schema-generator"}, AsyncMock())
+    headers = fake.calls[0]["headers"]
+    assert headers.get("X-Vision-Provider") == expected
+
+
 async def test_chat_executor_http_error_fails_loud():
     fake = _FakeClient(_FakeResp(503, text="Bridge at capacity"))
     with patch("httpx.AsyncClient", return_value=fake), \

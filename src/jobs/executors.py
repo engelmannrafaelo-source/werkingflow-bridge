@@ -497,6 +497,15 @@ async def chat_executor(
     # Jobs persist a whole result, so force non-streaming regardless of caller input.
     body = {**payload, "stream": False}
     headers = _build_headers(attribution)
+    # The public request carries both provider_tier (worker routing) and the
+    # vision-provider header (image-lane admission). A durable job persists the
+    # body but its localhost self-call does not pass through nginx, so restore
+    # the matching transport marker here. Without it a valid Gemini image job
+    # is accepted and then rejected inside the worker as an unapproved image
+    # path. Plain chat jobs keep their byte-identical header set.
+    from src.routing.app_provider_policy import GEMINI_VISION_TEST_TIER
+    if body.get("provider_tier") == GEMINI_VISION_TEST_TIER:
+        headers["X-Vision-Provider"] = "gemini"
 
     await report_progress({"phase": "llm", "model": body.get("model")})
 
