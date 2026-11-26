@@ -133,6 +133,44 @@ def test_locked_worker_accepts_gemini_vision_chat_job(client):
     spawn.assert_called_once()
 
 
+def test_locked_worker_accepts_schema_direct_pinned_chat_job(client):
+    en1, en2 = _enabled_patches()
+    create = AsyncMock()
+    attribution = {
+        "user_id": "schema-user",
+        "app_id": "werking-schema-generator",
+        "app_env": "staging",
+    }
+    with (
+        _auth_patch(), en1, en2,
+        patch("src.jobs.routes._attribution_extractor", return_value=attribution),
+        patch(
+            "src.routing.user_provider_override.get_user_provider_config",
+            new=AsyncMock(return_value={"provider": "anthropic_direct"}),
+        ),
+        patch("src.federation.self_origin_id", return_value="dev"),
+        patch("src.jobs.routes.get_executor", return_value=lambda: None),
+        patch("src.middleware.capacity_lock.get_capacity_lock",
+              return_value=_locked_cap_lock(remaining=900)),
+        patch("src.jobs.store_client.create_job", create),
+        patch("src.jobs.routes.spawn") as spawn,
+    ):
+        resp = client.post(
+            "/v1/jobs",
+            headers={
+                "X-App-ID": "werking-schema-generator",
+                "X-User-ID": "schema-user",
+                "X-App-Env": "preview",
+                "X-Tenant-ID": "schema-tenant",
+            },
+            json={"kind": "chat", "payload": {"enable_tools": False}},
+        )
+
+    assert resp.status_code == 200, resp.text
+    create.assert_awaited_once()
+    spawn.assert_called_once()
+
+
 def test_unlocked_worker_accepts_and_dispatches(client):
     en1, en2 = _enabled_patches()
     create = AsyncMock()

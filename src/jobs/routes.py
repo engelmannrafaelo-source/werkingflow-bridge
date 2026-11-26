@@ -24,6 +24,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -318,21 +319,19 @@ async def _job_runs_off_pool(
 ) -> bool:
     """True iff this job's LLM work provably runs OFF the subscription pool.
 
-    Only the app can answer this: it needs the job kind (request body) and, for
-    research, the caller's provider pin (database) — neither is visible to
-    nginx. A research job self-POSTs /v1/research (executors.research_executor)
+    Only the app can answer this: it needs the job kind (request body), the
+    caller's provider pin and its app environment — none is visible to nginx.
+    A research job self-POSTs /v1/research (executors.research_executor)
     and inherits that endpoint's pool-vs-cloud routing, so a capacity-locked
     worker CAN still serve it. Vetoing it here would rebuild, one layer down,
     exactly the gate that made the research-cloud overflow unreachable in the
     state it exists for.
 
     Conservative by construction: anything not provably off-pool returns False
-    and keeps the capacity veto. That deliberately includes globally
-    Bedrock-pinned users (whose research also takes the cloud path via an
-    implicit pin) — resolving that needs the full provider-override chain from
-    the research handler, and duplicating it here would be a drift risk for a
-    strictly smaller win than the correctness it buys. Status quo for them, no
-    regression.
+    and keeps the capacity veto. Chat reuses the canonical user/app provider
+    policy functions, so an effective direct/Bedrock/Vertex pin is exempt but
+    an ignored pin or an unavailable policy lookup is not. Research keeps its
+    own canonical cloud-routing resolver below.
 
     Inert while RESEARCH_CLOUD_ENABLED is off: resolve_research_cloud_routing
     returns False, so the veto behaves exactly as before. The one exception is
@@ -343,9 +342,67 @@ async def _job_runs_off_pool(
     """
     payload = body.payload or {}
     if body.kind == "chat":
-        from src.routing.app_provider_policy import GEMINI_VISION_TEST_TIER
+        from src.routing.app_provider_policy import (
+            GEMINI_VISION_TEST_TIER,
+            app_rule_outranks_user_pin,
+            apply_app_provider_policy,
+            client_requests_bedrock,
+            client_requests_gemini_vision,
+            resolve_app_provider_policy,
+        )
+        from src.routing.user_provider_override import (
+            apply_user_provider_override,
+            get_user_provider_config,
+        )
 
-        return payload.get("provider_tier") == GEMINI_VISION_TEST_TIER
+        if payload.get("provider_tier") == GEMINI_VISION_TEST_TIER:
+            return True
+        user_id = (attribution or {}).get("user_id")
+        if not user_id:
+            return False
+        try:
+            # Reuse the same policy functions as the later chat self-call.
+            # A direct/Bedrock/Vertex operator pin spends no CLI-account
+            # capacity, while a pin ignored in this environment resolves back
+            # to ``anthropic`` and deliberately keeps the veto.
+            probe = SimpleNamespace(
+                backend=payload.get("backend"),
+                provider_tier=payload.get("provider_tier"),
+                bedrock_region=payload.get("bedrock_region"),
+                enable_tools=bool(payload.get("enable_tools", False)),
+            )
+            asked_bedrock = client_requests_bedrock(probe)
+            asked_gemini = client_requests_gemini_vision(probe)
+            app_id = (attribution or {}).get("app_id")
+            provider = apply_user_provider_override(
+                probe,
+                await get_user_provider_config(user_id) or {},
+                app_env=(attribution or {}).get("app_env"),
+                app_id=app_id,
+            )
+            request_probe = SimpleNamespace(
+                headers={"X-App-ID": app_id} if app_id else {},
+                state=SimpleNamespace(principal=None),
+            )
+            app_rule, resolved_app_id = resolve_app_provider_policy(request_probe)
+            if provider is None or app_rule_outranks_user_pin(resolved_app_id):
+                if app_rule is not None:
+                    applied = apply_app_provider_policy(
+                        probe,
+                        app_rule,
+                        client_requested_bedrock=asked_bedrock,
+                        client_requested_gemini_vision=asked_gemini,
+                    )
+                    if applied:
+                        provider = applied
+            return provider in {"anthropic_direct", "bedrock", "vertex_eu"}
+        except Exception as exc:
+            # Unknown policy state must never widen admission.
+            logger.warning(
+                "job placement: chat provider routing probe failed, keeping "
+                "the capacity veto: %s", exc,
+            )
+            return False
     if body.kind != "research":
         return False
     try:

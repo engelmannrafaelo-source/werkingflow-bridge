@@ -81,7 +81,57 @@ async def test_non_research_kind_is_never_off_pool():
     from src.jobs.routes import JobCreateRequest, _job_runs_off_pool
 
     body = JobCreateRequest(kind="chat", payload={})
-    assert await _job_runs_off_pool(body, {"user_id": "u1"}) is False
+    with patch(
+        "src.routing.user_provider_override.get_user_provider_config",
+        new=AsyncMock(return_value=None),
+    ):
+        assert await _job_runs_off_pool(body, {"user_id": "u1"}) is False
+
+
+@pytest.mark.asyncio
+async def test_schema_staging_direct_pin_is_off_pool():
+    from src.jobs.routes import JobCreateRequest, _job_runs_off_pool
+
+    body = JobCreateRequest(kind="chat", payload={"enable_tools": False})
+    attribution = {
+        "user_id": "schema-user",
+        "app_id": "werking-schema-generator",
+        "app_env": "staging",
+    }
+    with patch(
+        "src.routing.user_provider_override.get_user_provider_config",
+        new=AsyncMock(return_value={"provider": "anthropic_direct"}),
+    ):
+        assert await _job_runs_off_pool(body, attribution) is True
+
+
+@pytest.mark.asyncio
+async def test_direct_pin_ignored_for_unapproved_staging_app_keeps_veto():
+    from src.jobs.routes import JobCreateRequest, _job_runs_off_pool
+
+    body = JobCreateRequest(kind="chat", payload={"enable_tools": False})
+    attribution = {
+        "user_id": "other-user",
+        "app_id": "unlisted-staging-app",
+        "app_env": "staging",
+    }
+    with patch(
+        "src.routing.user_provider_override.get_user_provider_config",
+        new=AsyncMock(return_value={"provider": "anthropic_direct"}),
+    ):
+        assert await _job_runs_off_pool(body, attribution) is False
+
+
+@pytest.mark.asyncio
+async def test_chat_pin_probe_failure_keeps_veto():
+    from src.jobs.routes import JobCreateRequest, _job_runs_off_pool
+
+    body = JobCreateRequest(kind="chat", payload={})
+    with patch(
+        "src.routing.user_provider_override.get_user_provider_config",
+        new=AsyncMock(side_effect=RuntimeError("platform unavailable")),
+    ):
+        assert await _job_runs_off_pool(body, {"user_id": "u1"}) is False
 
 
 @pytest.mark.asyncio
